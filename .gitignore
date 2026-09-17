@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+
+# Google OAuth
+secrets/
+credentials.json
+token.json
+
+# Database
+data/
+*.db
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
