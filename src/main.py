@@ -1,1 +1,6 @@
-print('Gmail Sorter Container Started this is Wan Testing')
+import time
+
+print("Gmail Sorter Container Started")
+
+while True:
+    time.sleep(60)
