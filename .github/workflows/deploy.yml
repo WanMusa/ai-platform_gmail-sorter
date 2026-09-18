@@ -25,6 +25,8 @@ jobs:
 
             git pull origin main
 
+            docker compose up -d --build
+
             echo "=== AFTER ==="
             git rev-parse HEAD
 

@@ -1,0 +1,12 @@
+services:
+  gmail-sorter:
+    build: .
+    container_name: gmail-sorter
+
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./data:/app/data
