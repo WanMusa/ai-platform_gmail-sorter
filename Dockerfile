@@ -4,4 +4,4 @@ WORKDIR /app
 
 COPY . .
 
-CMD ["python", "-c", "print('Gmail Sorter Container Started')"]
+CMD ["python", "src/main.py"]
