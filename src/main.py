@@ -143,19 +143,28 @@ async def telegram_webhook(request: Request) -> JSONResponse:
 
     payload = await request.json()
     callback_query = payload.get("callback_query")
-    if not callback_query:
-        return JSONResponse(status_code=200, content={"ok": True})
+    if callback_query:
+        callback_data = callback_query.get("data", "")
+        callback_id = callback_query.get("id", "")
+        user = callback_query.get("from", {})
+        decision_by = user.get("username") or str(user.get("id") or "unknown")
 
-    callback_data = callback_query.get("data", "")
-    callback_id = callback_query.get("id", "")
-    user = callback_query.get("from", {})
-    decision_by = user.get("username") or str(user.get("id") or "unknown")
+        result = processor.handle_telegram_callback(callback_data=callback_data, decision_by=decision_by)
+        if callback_id:
+            try:
+                await asyncio.to_thread(processor.answer_telegram_callback_query, callback_id, result)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Failed to answer callback query: %s", exc)
+        return JSONResponse(status_code=200, content={"ok": True, "result": result})
 
-    result = processor.handle_telegram_callback(callback_data=callback_data, decision_by=decision_by)
-    if callback_id:
-        try:
-            await asyncio.to_thread(processor.answer_telegram_callback_query, callback_id, result)
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Failed to answer callback query: %s", exc)
+    message = payload.get("message", {})
+    if message:
+        text = (message.get("text") or "").strip()
+        user = message.get("from", {})
+        decision_by = user.get("username") or str(user.get("id") or "unknown")
+        chat_id = str(message.get("chat", {}).get("id") or settings.telegram_chat_id)
+        if text:
+            result = processor.handle_telegram_text(text=text, decision_by=decision_by, chat_id=chat_id)
+            return JSONResponse(status_code=200, content={"ok": True, "result": result})
 
-    return JSONResponse(status_code=200, content={"ok": True, "result": result})
+    return JSONResponse(status_code=200, content={"ok": True})

@@ -272,3 +272,53 @@ class Repo:
 					(decision, decision_by, review_id),
 				)
 			conn.commit()
+
+	def set_pending_review_status(
+		self,
+		review_id: str,
+		status: str,
+		decision_by: str | None = None,
+	) -> None:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					UPDATE pending_reviews
+					SET status = %s,
+						decision_by = COALESCE(%s, decision_by),
+						updated_at = NOW()
+					WHERE review_id = %s
+					""",
+					(status, decision_by, review_id),
+				)
+			conn.commit()
+
+	def update_pending_review_payload(self, review_id: str, state_payload: dict[str, Any]) -> None:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					UPDATE pending_reviews
+					SET state_payload = %s::jsonb,
+						updated_at = NOW()
+					WHERE review_id = %s
+					""",
+					(json.dumps(state_payload), review_id),
+				)
+			conn.commit()
+
+	def get_pending_reply_prompt(self, decision_by: str) -> dict[str, Any] | None:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					SELECT review_id, gmail_message_id, state_payload, telegram_chat_id, status, decision_by
+					FROM pending_reviews
+					WHERE status = 'awaiting_reply_text'
+					  AND decision_by = %s
+					ORDER BY updated_at DESC
+					LIMIT 1
+					""",
+					(decision_by,),
+				)
+				return cur.fetchone()

@@ -33,6 +33,8 @@ class EmailState(TypedDict, total=False):
     needs_human_review: bool
     proposed_actions: list[str]
     executed_actions: list[str]
+    review_type: str
+    reply_instruction_text: str
     status: str
 
 
@@ -264,12 +266,21 @@ class GmailProcessor:
         else:
             proposed.append("summarize")
 
-        needs_review = confidence < self.settings.confidence_threshold
-        if any(action in self.settings.approval_required_actions for action in proposed):
+        review_type = "none"
+        needs_review = False
+        if confidence < self.settings.confidence_threshold:
             needs_review = True
+            review_type = "category_select"
+        elif category == "action_required":
+            needs_review = True
+            review_type = "reply_mode"
+        elif category == "meeting":
+            needs_review = True
+            review_type = "meeting_confirm"
 
         state["proposed_actions"] = proposed
         state["needs_human_review"] = needs_review
+        state["review_type"] = review_type
         return state
 
     def _route_decision(self, state: EmailState) -> str:
@@ -288,7 +299,7 @@ class GmailProcessor:
             state_payload=dict(state),
             telegram_chat_id=self.settings.telegram_chat_id,
         )
-        self._send_telegram_review_request(state, review_id)
+        self._send_telegram_review_request(state, review_id, state.get("review_type", "none"))
         state["status"] = "pending_human_review"
         return state
 
@@ -296,66 +307,109 @@ class GmailProcessor:
         if not callback_data.startswith("review:"):
             return "Unsupported action"
 
-        parts = callback_data.split(":", 2)
-        if len(parts) != 3:
+        parts = callback_data.split(":")
+        if len(parts) < 4:
             return "Malformed review action"
 
-        _, review_id, action = parts
+        _, review_id, action_type, action_value = parts[0], parts[1], parts[2], parts[3]
         review = self.repo.get_pending_review(review_id)
         if not review:
             return "Review not found"
 
-        if review.get("status") != "pending":
+        if review.get("status") not in {"pending", "awaiting_reply_text"}:
             return f"Review already resolved as {review.get('status')}"
 
         state_payload = review.get("state_payload") or {}
-        if action == "approve":
-            state = EmailState(**state_payload)
-            state = self._execute_actions(state, allow_sensitive=True)
+        state = EmailState(**state_payload)
+
+        if action_type == "cat":
+            state["category"] = action_value
+            state["confidence"] = 1.0
+            state = self._apply_category_override(state)
+            self.repo.update_pending_review_payload(review_id, dict(state))
+
+            next_review = state.get("review_type", "none")
+            if next_review == "reply_mode":
+                self._send_reply_mode_request(state, review_id)
+                self.repo.set_pending_review_status(review_id, "pending", decision_by)
+                return "Category set to action_required. Choose reply mode"
+            if next_review == "meeting_confirm":
+                self._send_meeting_confirmation_request(state, review_id)
+                self.repo.set_pending_review_status(review_id, "pending", decision_by)
+                return "Category set to meeting. Confirm calendar action"
+
+            state = self._execute_actions(state, allow_sensitive=False)
             state["status"] = "approved_and_processed"
-
             self.repo.resolve_pending_review(review_id, "approved", decision_by)
-            self.repo.upsert_processed_email(
-                gmail_message_id=state["gmail_message_id"],
-                sender=state.get("sender", ""),
-                subject=state.get("subject", ""),
-                received_at=state.get("received_at"),
-                category=state.get("category", "others"),
-                confidence=float(state.get("confidence", 0.0)),
-                summary=state.get("summary", ""),
-                status=state.get("status", "approved_and_processed"),
-            )
-            self.repo.insert_workflow_log(
-                gmail_message_id=state["gmail_message_id"],
-                action="review_approved",
-                details={
-                    "review_id": review_id,
-                    "decision_by": decision_by,
-                    "executed_actions": state.get("executed_actions", []),
-                },
-            )
-            return "Approved and actions executed"
+            self._persist_state_after_review(state, review_id, decision_by, "review_category_override")
+            return f"Category updated to {action_value}. Actions executed"
 
-        if action == "reject":
-            self.repo.resolve_pending_review(review_id, "rejected", decision_by)
-            self.repo.upsert_processed_email(
-                gmail_message_id=state_payload.get("gmail_message_id", ""),
-                sender=state_payload.get("sender", ""),
-                subject=state_payload.get("subject", ""),
-                received_at=state_payload.get("received_at"),
-                category=state_payload.get("category", "others"),
-                confidence=float(state_payload.get("confidence", 0.0)),
-                summary=state_payload.get("summary", ""),
-                status="rejected",
-            )
-            self.repo.insert_workflow_log(
-                gmail_message_id=state_payload.get("gmail_message_id", ""),
-                action="review_rejected",
-                details={"review_id": review_id, "decision_by": decision_by},
-            )
-            return "Rejected"
+        if action_type == "reply":
+            if action_value == "draft":
+                state = self._execute_actions(state, allow_sensitive=False)
+                state["status"] = "approved_and_processed"
+                self.repo.resolve_pending_review(review_id, "approved", decision_by)
+                self._persist_state_after_review(state, review_id, decision_by, "review_reply_draft")
+                return "Draft reply flow approved"
+
+            if action_value == "manual":
+                self.repo.set_pending_review_status(review_id, "awaiting_reply_text", decision_by)
+                self._send_reply_text_prompt(state)
+                return "Send the exact reply text in your next message"
+
+            if action_value == "skip":
+                state["proposed_actions"] = [
+                    action for action in state.get("proposed_actions", []) if action != "draft_reply"
+                ]
+                state = self._execute_actions(state, allow_sensitive=False)
+                state["status"] = "approved_and_processed"
+                self.repo.resolve_pending_review(review_id, "approved", decision_by)
+                self._persist_state_after_review(state, review_id, decision_by, "review_reply_skip")
+                return "Reply skipped. Summary sent"
+
+        if action_type == "meeting":
+            if action_value == "yes":
+                state = self._execute_actions(state, allow_sensitive=True)
+                state["status"] = "approved_and_processed"
+                self.repo.resolve_pending_review(review_id, "approved", decision_by)
+                self._persist_state_after_review(state, review_id, decision_by, "review_meeting_approved")
+                return "Meeting confirmed. Calendar action triggered"
+
+            if action_value == "no":
+                state["proposed_actions"] = [
+                    action
+                    for action in state.get("proposed_actions", [])
+                    if action != "create_calendar_event"
+                ]
+                state = self._execute_actions(state, allow_sensitive=False)
+                state["status"] = "rejected"
+                self.repo.resolve_pending_review(review_id, "rejected", decision_by)
+                self._persist_state_after_review(state, review_id, decision_by, "review_meeting_rejected")
+                return "Meeting action skipped"
 
         return "Unknown review decision"
+
+    def handle_telegram_text(self, text: str, decision_by: str, chat_id: str) -> str:
+        pending = self.repo.get_pending_reply_prompt(decision_by)
+        if not pending:
+            if text.strip() == "/start":
+                self._telegram_send(
+                    "Gmail Sorter bot is active. I will send summaries and approval requests here.",
+                    chat_id=chat_id,
+                )
+                return "Start acknowledged"
+            return "No pending reply request"
+
+        review_id = pending["review_id"]
+        state_payload = pending.get("state_payload") or {}
+        state = EmailState(**state_payload)
+        state["reply_instruction_text"] = text.strip()
+
+        self._send_telegram_manual_reply_capture_notice(state)
+        state["status"] = "approved_and_processed"
+        self.repo.resolve_pending_review(review_id, "approved", decision_by)
+        self._persist_state_after_review(state, review_id, decision_by, "review_manual_reply_captured")
+        return "Reply text captured"
 
     def answer_telegram_callback_query(self, callback_query_id: str, text: str) -> None:
         if not self.settings.telegram_bot_token:
@@ -441,27 +495,23 @@ class GmailProcessor:
         )
         self._telegram_send(text)
 
-    def _send_telegram_review_request(self, state: EmailState, review_id: str) -> None:
+    def _send_telegram_review_request(self, state: EmailState, review_id: str, review_type: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
 
-        text = (
-            "Review required\n"
-            f"Category: {state.get('category', 'unknown')}\n"
-            f"Confidence: {state.get('confidence', 0.0):.2f}\n"
-            f"From: {state.get('sender', 'unknown')}\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            f"Summary: {state.get('summary', '')}"
-        )
-        reply_markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "Approve", "callback_data": f"review:{review_id}:approve"},
-                    {"text": "Reject", "callback_data": f"review:{review_id}:reject"},
-                ]
-            ]
-        }
-        self._telegram_send(text, reply_markup=reply_markup)
+        if review_type == "category_select":
+            self._send_category_selection_request(state, review_id)
+            return
+
+        if review_type == "reply_mode":
+            self._send_reply_mode_request(state, review_id)
+            return
+
+        if review_type == "meeting_confirm":
+            self._send_meeting_confirmation_request(state, review_id)
+            return
+
+        self._send_telegram_summary(state, requires_review=False)
 
     def _send_telegram_reply_draft_notice(self, state: EmailState) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
@@ -483,10 +533,96 @@ class GmailProcessor:
         )
         self._telegram_send(text)
 
-    def _telegram_send(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
+    def _send_telegram_manual_reply_capture_notice(self, state: EmailState) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Reply text captured\n"
+            f"Message ID: {state.get('gmail_message_id')}\n"
+            f"Reply: {state.get('reply_instruction_text', '')}"
+        )
+        self._telegram_send(text)
+
+    def _send_category_selection_request(self, state: EmailState, review_id: str) -> None:
+        text = (
+            "Low confidence classification\n"
+            f"From: {state.get('sender', 'unknown')}\n"
+            f"Subject: {state.get('subject', 'no subject')}\n"
+            f"Summary: {state.get('summary', '')}\n\n"
+            "Select the correct category:"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Information", "callback_data": f"review:{review_id}:cat:information"},
+                    {"text": "Action", "callback_data": f"review:{review_id}:cat:action_required"},
+                ],
+                [
+                    {"text": "Meeting", "callback_data": f"review:{review_id}:cat:meeting"},
+                    {"text": "Marketing", "callback_data": f"review:{review_id}:cat:marketing"},
+                ],
+                [
+                    {"text": "Other", "callback_data": f"review:{review_id}:cat:others"},
+                ],
+            ]
+        }
+        self._telegram_send(text, reply_markup=reply_markup)
+
+    def _send_reply_mode_request(self, state: EmailState, review_id: str) -> None:
+        text = (
+            "Action required email\n"
+            f"From: {state.get('sender', 'unknown')}\n"
+            f"Subject: {state.get('subject', 'no subject')}\n"
+            f"Summary: {state.get('summary', '')}\n\n"
+            "How should I handle the reply?"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Draft Reply", "callback_data": f"review:{review_id}:reply:draft"},
+                    {"text": "I will type reply", "callback_data": f"review:{review_id}:reply:manual"},
+                ],
+                [
+                    {"text": "Skip reply", "callback_data": f"review:{review_id}:reply:skip"},
+                ],
+            ]
+        }
+        self._telegram_send(text, reply_markup=reply_markup)
+
+    def _send_meeting_confirmation_request(self, state: EmailState, review_id: str) -> None:
+        text = (
+            "Meeting email detected\n"
+            f"From: {state.get('sender', 'unknown')}\n"
+            f"Subject: {state.get('subject', 'no subject')}\n"
+            f"Summary: {state.get('summary', '')}\n\n"
+            "Confirm appointment and create calendar event?"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Yes, add to calendar", "callback_data": f"review:{review_id}:meeting:yes"},
+                    {"text": "No", "callback_data": f"review:{review_id}:meeting:no"},
+                ]
+            ]
+        }
+        self._telegram_send(text, reply_markup=reply_markup)
+
+    def _send_reply_text_prompt(self, state: EmailState) -> None:
+        text = (
+            "Please send the exact reply text in your next message.\n"
+            f"Subject: {state.get('subject', 'no subject')}"
+        )
+        self._telegram_send(text)
+
+    def _telegram_send(
+        self,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+        chat_id: str | None = None,
+    ) -> None:
         api_base = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
         payload = {
-            "chat_id": self.settings.telegram_chat_id,
+            "chat_id": chat_id or self.settings.telegram_chat_id,
             "text": text,
         }
         if reply_markup is not None:
@@ -519,6 +655,62 @@ class GmailProcessor:
         except urllib.error.URLError as exc:
             logger.warning("Telegram network error=%s", exc)
             return False
+
+    def _humanize_action(self, action: str) -> str:
+        mapping = {
+            "label_marketing": "Apply labels AI and AI/to-delete",
+            "summarize": "Send summary to Telegram",
+            "draft_reply": "Send reply-draft suggestion",
+            "create_calendar_event": "Create a Google Calendar event",
+        }
+        return mapping.get(action, action)
+
+    def _apply_category_override(self, state: EmailState) -> EmailState:
+        category = state.get("category", "others")
+        if category == "information":
+            state["proposed_actions"] = ["summarize"]
+            state["review_type"] = "none"
+        elif category == "action_required":
+            state["proposed_actions"] = ["summarize", "draft_reply"]
+            state["review_type"] = "reply_mode"
+        elif category == "meeting":
+            state["proposed_actions"] = ["summarize", "create_calendar_event"]
+            state["review_type"] = "meeting_confirm"
+        elif category == "marketing":
+            state["proposed_actions"] = ["label_marketing"]
+            state["review_type"] = "none"
+        else:
+            state["proposed_actions"] = ["summarize"]
+            state["review_type"] = "none"
+        return state
+
+    def _persist_state_after_review(
+        self,
+        state: EmailState,
+        review_id: str,
+        decision_by: str | None,
+        action: str,
+    ) -> None:
+        self.repo.upsert_processed_email(
+            gmail_message_id=state.get("gmail_message_id", ""),
+            sender=state.get("sender", ""),
+            subject=state.get("subject", ""),
+            received_at=state.get("received_at"),
+            category=state.get("category", "others"),
+            confidence=float(state.get("confidence", 0.0)),
+            summary=state.get("summary", ""),
+            status=state.get("status", "processed"),
+        )
+        self.repo.insert_workflow_log(
+            gmail_message_id=state.get("gmail_message_id", ""),
+            action=action,
+            details={
+                "review_id": review_id,
+                "decision_by": decision_by,
+                "executed_actions": state.get("executed_actions", []),
+                "review_type": state.get("review_type", "none"),
+            },
+        )
 
 
 def parse_publish_time(value: str | None) -> str | None:
