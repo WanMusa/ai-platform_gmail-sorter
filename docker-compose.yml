@@ -8,6 +8,13 @@ services:
     env_file:
       - .env
 
+    environment:
+      APP_PORT: ${APP_PORT:-8000}
+      VIRTUAL_HOST: ${APP_DOMAIN}
+      VIRTUAL_PORT: ${APP_PORT:-8000}
+      LETSENCRYPT_HOST: ${APP_DOMAIN}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+
     volumes:
       - ./data:/app/data
     
