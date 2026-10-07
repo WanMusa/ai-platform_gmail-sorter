@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 from uuid import uuid4
@@ -492,7 +493,7 @@ class GmailProcessor:
             payload["reply_markup"] = reply_markup
         self._telegram_post(api_base, payload)
 
-    def _telegram_post(self, url: str, payload: dict[str, Any]) -> None:
+    def _telegram_post(self, url: str, payload: dict[str, Any]) -> bool:
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -500,11 +501,24 @@ class GmailProcessor:
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
-            raw = response.read().decode("utf-8")
-            body = json.loads(raw)
-            if not body.get("ok"):
-                logger.warning("Telegram call failed payload=%s response=%s", payload, body)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                raw = response.read().decode("utf-8")
+                body = json.loads(raw)
+                if not body.get("ok"):
+                    logger.warning(
+                        "Telegram call failed payload=%s response=%s",
+                        payload,
+                        body,
+                    )
+                    return False
+                return True
+        except urllib.error.HTTPError as exc:
+            logger.warning("Telegram HTTP error code=%s reason=%s", exc.code, exc.reason)
+            return False
+        except urllib.error.URLError as exc:
+            logger.warning("Telegram network error=%s", exc)
+            return False
 
 
 def parse_publish_time(value: str | None) -> str | None:
