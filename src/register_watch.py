@@ -1,8 +1,8 @@
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
-from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -21,6 +21,22 @@ def _read_env(name: str, default: str | None = None, required: bool = False) -> 
     return value or ""
 
 
+def _load_dotenv_file(env_path: Path = Path(".env")) -> None:
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        os.environ.setdefault(key, value)
+
+
 def _load_credentials(token_path: Path, scopes: list[str]) -> Credentials:
     if not token_path.exists():
         raise FileNotFoundError(
@@ -36,7 +52,19 @@ def _load_credentials(token_path: Path, scopes: list[str]) -> Credentials:
     return creds
 
 
-def register_watch() -> None:
+def _load_scopes() -> list[str]:
+    scopes_raw = _read_env("GOOGLE_OAUTH_SCOPES", default=",".join(DEFAULT_SCOPES))
+    return [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
+
+
+def _build_gmail_client():
+    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="local/token.json"))
+    scopes = _load_scopes()
+    creds = _load_credentials(token_path=token_path, scopes=scopes)
+    return build("gmail", "v1", credentials=creds)
+
+
+def register_watch() -> dict[str, Any]:
     project_id = _read_env("GCP_PROJECT_ID", required=True)
     topic_name = _read_env("GMAIL_PUBSUB_TOPIC", default="gmail-sorter-events")
 
@@ -47,12 +75,7 @@ def register_watch() -> None:
         "GMAIL_WATCH_LABEL_FILTER_BEHAVIOR", default="INCLUDE"
     ).upper()
 
-    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="local/token.json"))
-    scopes_raw = _read_env("GOOGLE_OAUTH_SCOPES", default=",".join(DEFAULT_SCOPES))
-    scopes = [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
-
-    creds = _load_credentials(token_path=token_path, scopes=scopes)
-    gmail = build("gmail", "v1", credentials=creds)
+    gmail = _build_gmail_client()
 
     request_body = {
         "topicName": f"projects/{project_id}/topics/{topic_name}",
@@ -62,25 +85,26 @@ def register_watch() -> None:
 
     response = gmail.users().watch(userId="me", body=request_body).execute()
 
+    return response
+
+
+def register_watch_cli() -> None:
+    response = register_watch()
+
     print("Watch registration successful")
     print(f"History ID: {response.get('historyId')}")
     print(f"Expiration (ms epoch): {response.get('expiration')}")
 
 
 def stop_watch() -> None:
-    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="local/token.json"))
-    scopes_raw = _read_env("GOOGLE_OAUTH_SCOPES", default=",".join(DEFAULT_SCOPES))
-    scopes = [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
-
-    creds = _load_credentials(token_path=token_path, scopes=scopes)
-    gmail = build("gmail", "v1", credentials=creds)
+    gmail = _build_gmail_client()
 
     gmail.users().stop(userId="me").execute()
     print("Watch stopped")
 
 
 def main() -> None:
-    load_dotenv()
+    _load_dotenv_file()
 
     parser = argparse.ArgumentParser(description="Register or stop Gmail Pub/Sub watch")
     parser.add_argument(
@@ -92,7 +116,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.action == "register":
-        register_watch()
+        register_watch_cli()
         return
 
     stop_watch()

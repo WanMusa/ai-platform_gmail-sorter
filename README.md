@@ -32,3 +32,10 @@ To stop watch:
 ```powershell
 python -m src.register_watch stop
 ```
+
+Gmail watches expire periodically by design. This app can renew automatically when running on VPS:
+
+- `GMAIL_WATCH_AUTO_RENEW=true`
+- `GMAIL_WATCH_RENEW_INTERVAL_SECONDS=21600`
+
+When enabled, the app renews watch in the background and logs renewal results.
