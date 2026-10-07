@@ -12,3 +12,23 @@ Event-driven Gmail assistant using:
 - SQLite
 - Docker
 - GitHub Actions
+
+## Gmail Watch Registration
+
+After OAuth token setup, register Gmail webhook watch locally:
+
+1. Set values in `.env`:
+	- `GCP_PROJECT_ID`
+	- `GMAIL_PUBSUB_TOPIC`
+	- `GMAIL_WATCH_LABEL_IDS` (recommended: `INBOX`)
+2. Run watch registration:
+
+```powershell
+python -m src.register_watch register
+```
+
+To stop watch:
+
+```powershell
+python -m src.register_watch stop
+```

@@ -1,0 +1,102 @@
+import argparse
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+
+DEFAULT_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+
+def _read_env(name: str, default: str | None = None, required: bool = False) -> str:
+    value = os.getenv(name, default)
+    if required and not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value or ""
+
+
+def _load_credentials(token_path: Path, scopes: list[str]) -> Credentials:
+    if not token_path.exists():
+        raise FileNotFoundError(
+            f"Token file not found at {token_path}. Generate it first with your OAuth flow."
+        )
+
+    creds = Credentials.from_authorized_user_file(str(token_path), scopes)
+
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+
+    return creds
+
+
+def register_watch() -> None:
+    project_id = _read_env("GCP_PROJECT_ID", required=True)
+    topic_name = _read_env("GMAIL_PUBSUB_TOPIC", default="gmail-sorter-events")
+
+    label_ids_raw = _read_env("GMAIL_WATCH_LABEL_IDS", default="INBOX")
+    label_ids = [item.strip() for item in label_ids_raw.split(",") if item.strip()]
+
+    label_filter_behavior = _read_env(
+        "GMAIL_WATCH_LABEL_FILTER_BEHAVIOR", default="INCLUDE"
+    ).upper()
+
+    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="local/token.json"))
+    scopes_raw = _read_env("GOOGLE_OAUTH_SCOPES", default=",".join(DEFAULT_SCOPES))
+    scopes = [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
+
+    creds = _load_credentials(token_path=token_path, scopes=scopes)
+    gmail = build("gmail", "v1", credentials=creds)
+
+    request_body = {
+        "topicName": f"projects/{project_id}/topics/{topic_name}",
+        "labelIds": label_ids,
+        "labelFilterBehavior": label_filter_behavior,
+    }
+
+    response = gmail.users().watch(userId="me", body=request_body).execute()
+
+    print("Watch registration successful")
+    print(f"History ID: {response.get('historyId')}")
+    print(f"Expiration (ms epoch): {response.get('expiration')}")
+
+
+def stop_watch() -> None:
+    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="local/token.json"))
+    scopes_raw = _read_env("GOOGLE_OAUTH_SCOPES", default=",".join(DEFAULT_SCOPES))
+    scopes = [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
+
+    creds = _load_credentials(token_path=token_path, scopes=scopes)
+    gmail = build("gmail", "v1", credentials=creds)
+
+    gmail.users().stop(userId="me").execute()
+    print("Watch stopped")
+
+
+def main() -> None:
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Register or stop Gmail Pub/Sub watch")
+    parser.add_argument(
+        "action",
+        choices=["register", "stop"],
+        help="register = create/refresh watch, stop = remove watch",
+    )
+
+    args = parser.parse_args()
+
+    if args.action == "register":
+        register_watch()
+        return
+
+    stop_watch()
+
+
+if __name__ == "__main__":
+    main()
