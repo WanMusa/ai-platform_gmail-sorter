@@ -131,3 +131,31 @@ async def gmail_pubsub_webhook(request: Request) -> JSONResponse:
         logger.info("Duplicate Pub/Sub event ignored event_id=%s", event_id)
 
     return JSONResponse(status_code=200, content={"ok": True})
+
+
+@app.post("/webhooks/telegram")
+async def telegram_webhook(request: Request) -> JSONResponse:
+    secret = settings.telegram_webhook_secret
+    if secret:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_secret != secret:
+            return JSONResponse(status_code=401, content={"ok": False, "error": "invalid secret"})
+
+    payload = await request.json()
+    callback_query = payload.get("callback_query")
+    if not callback_query:
+        return JSONResponse(status_code=200, content={"ok": True})
+
+    callback_data = callback_query.get("data", "")
+    callback_id = callback_query.get("id", "")
+    user = callback_query.get("from", {})
+    decision_by = user.get("username") or str(user.get("id") or "unknown")
+
+    result = processor.handle_telegram_callback(callback_data=callback_data, decision_by=decision_by)
+    if callback_id:
+        try:
+            await asyncio.to_thread(processor.answer_telegram_callback_query, callback_id, result)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to answer callback query: %s", exc)
+
+    return JSONResponse(status_code=200, content={"ok": True, "result": result})

@@ -47,6 +47,7 @@ class Settings:
 
 	telegram_bot_token: str
 	telegram_chat_id: str
+	telegram_webhook_secret: str
 
 	auto_actions: list[str]
 	approval_required_actions: list[str]
@@ -85,6 +86,7 @@ def get_settings() -> Settings:
 		).upper(),
 		telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
 		telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+		telegram_webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
 		auto_actions=_env_csv(
 			"AUTO_ACTIONS", "label_marketing,summarize,draft_reply"
 		),

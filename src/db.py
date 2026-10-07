@@ -213,3 +213,62 @@ class Repo:
 					(gmail_message_id, action, json.dumps(details)),
 				)
 			conn.commit()
+
+	def create_pending_review(
+		self,
+		review_id: str,
+		gmail_message_id: str,
+		state_payload: dict[str, Any],
+		telegram_chat_id: str,
+	) -> None:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					INSERT INTO pending_reviews (
+						review_id,
+						gmail_message_id,
+						state_payload,
+						telegram_chat_id,
+						status
+					)
+					VALUES (%s, %s, %s::jsonb, %s, 'pending')
+					ON CONFLICT (review_id) DO NOTHING
+					""",
+					(review_id, gmail_message_id, json.dumps(state_payload), telegram_chat_id),
+				)
+			conn.commit()
+
+	def get_pending_review(self, review_id: str) -> dict[str, Any] | None:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					SELECT review_id, gmail_message_id, state_payload, telegram_chat_id, status
+					FROM pending_reviews
+					WHERE review_id = %s
+					""",
+					(review_id,),
+				)
+				return cur.fetchone()
+
+	def resolve_pending_review(
+		self,
+		review_id: str,
+		decision: str,
+		decision_by: str | None,
+	) -> None:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					UPDATE pending_reviews
+					SET status = %s,
+						decision_by = %s,
+						decided_at = NOW(),
+						updated_at = NOW()
+					WHERE review_id = %s
+					""",
+					(decision, decision_by, review_id),
+				)
+			conn.commit()

@@ -41,3 +41,25 @@ Gmail watches expire periodically by design. This app can renew automatically wh
 - `GMAIL_WATCH_RENEW_INTERVAL_SECONDS=21600`
 
 When enabled, the app renews watch in the background and logs renewal results.
+
+## Telegram Interactive Approval
+
+The app supports Telegram inline approval buttons for human review actions.
+
+Required env:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `TELEGRAM_WEBHOOK_SECRET` (recommended)
+
+Set Telegram webhook to app endpoint:
+
+```text
+https://wanagents.duckdns.org/webhooks/telegram
+```
+
+Set webhook with optional secret token:
+
+```text
+https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://wanagents.duckdns.org/webhooks/telegram&secret_token=<TELEGRAM_WEBHOOK_SECRET>
+```

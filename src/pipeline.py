@@ -4,6 +4,7 @@ import json
 import logging
 import urllib.parse
 import urllib.request
+from uuid import uuid4
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, TypedDict
@@ -245,9 +246,104 @@ class GmailProcessor:
         return "review" if state.get("needs_human_review") else "execute"
 
     def _node_execute(self, state: EmailState) -> EmailState:
+        state = self._execute_actions(state, allow_sensitive=False)
+        state["status"] = "processed"
+        return state
+
+    def _node_review(self, state: EmailState) -> EmailState:
+        review_id = uuid4().hex
+        self.repo.create_pending_review(
+            review_id=review_id,
+            gmail_message_id=state["gmail_message_id"],
+            state_payload=dict(state),
+            telegram_chat_id=self.settings.telegram_chat_id,
+        )
+        self._send_telegram_review_request(state, review_id)
+        state["status"] = "pending_human_review"
+        return state
+
+    def handle_telegram_callback(self, callback_data: str, decision_by: str | None) -> str:
+        if not callback_data.startswith("review:"):
+            return "Unsupported action"
+
+        parts = callback_data.split(":", 2)
+        if len(parts) != 3:
+            return "Malformed review action"
+
+        _, review_id, action = parts
+        review = self.repo.get_pending_review(review_id)
+        if not review:
+            return "Review not found"
+
+        if review.get("status") != "pending":
+            return f"Review already resolved as {review.get('status')}"
+
+        state_payload = review.get("state_payload") or {}
+        if action == "approve":
+            state = EmailState(**state_payload)
+            state = self._execute_actions(state, allow_sensitive=True)
+            state["status"] = "approved_and_processed"
+
+            self.repo.resolve_pending_review(review_id, "approved", decision_by)
+            self.repo.upsert_processed_email(
+                gmail_message_id=state["gmail_message_id"],
+                sender=state.get("sender", ""),
+                subject=state.get("subject", ""),
+                received_at=state.get("received_at"),
+                category=state.get("category", "others"),
+                confidence=float(state.get("confidence", 0.0)),
+                summary=state.get("summary", ""),
+                status=state.get("status", "approved_and_processed"),
+            )
+            self.repo.insert_workflow_log(
+                gmail_message_id=state["gmail_message_id"],
+                action="review_approved",
+                details={
+                    "review_id": review_id,
+                    "decision_by": decision_by,
+                    "executed_actions": state.get("executed_actions", []),
+                },
+            )
+            return "Approved and actions executed"
+
+        if action == "reject":
+            self.repo.resolve_pending_review(review_id, "rejected", decision_by)
+            self.repo.upsert_processed_email(
+                gmail_message_id=state_payload.get("gmail_message_id", ""),
+                sender=state_payload.get("sender", ""),
+                subject=state_payload.get("subject", ""),
+                received_at=state_payload.get("received_at"),
+                category=state_payload.get("category", "others"),
+                confidence=float(state_payload.get("confidence", 0.0)),
+                summary=state_payload.get("summary", ""),
+                status="rejected",
+            )
+            self.repo.insert_workflow_log(
+                gmail_message_id=state_payload.get("gmail_message_id", ""),
+                action="review_rejected",
+                details={"review_id": review_id, "decision_by": decision_by},
+            )
+            return "Rejected"
+
+        return "Unknown review decision"
+
+    def answer_telegram_callback_query(self, callback_query_id: str, text: str) -> None:
+        if not self.settings.telegram_bot_token:
+            return
+        api_base = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/answerCallbackQuery"
+        self._telegram_post(
+            api_base,
+            {
+                "callback_query_id": callback_query_id,
+                "text": text,
+                "show_alert": False,
+            },
+        )
+
+    def _execute_actions(self, state: EmailState, allow_sensitive: bool) -> EmailState:
         executed = list(state.get("executed_actions", []))
         for action in state.get("proposed_actions", []):
-            if action not in self.settings.auto_actions:
+            if not allow_sensitive and action not in self.settings.auto_actions:
                 continue
             if action == "label_marketing":
                 self._apply_marketing_labels(state["gmail_message_id"])
@@ -258,14 +354,11 @@ class GmailProcessor:
             elif action == "draft_reply":
                 self._send_telegram_reply_draft_notice(state)
                 executed.append(action)
+            elif action == "create_calendar_event":
+                self._send_telegram_calendar_placeholder(state)
+                executed.append(action)
 
         state["executed_actions"] = executed
-        state["status"] = "processed"
-        return state
-
-    def _node_review(self, state: EmailState) -> EmailState:
-        self._send_telegram_summary(state, requires_review=True)
-        state["status"] = "pending_human_review"
         return state
 
     def _summarize_text(self, subject: str, snippet: str) -> str:
@@ -318,6 +411,28 @@ class GmailProcessor:
         )
         self._telegram_send(text)
 
+    def _send_telegram_review_request(self, state: EmailState, review_id: str) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+
+        text = (
+            "Review required\n"
+            f"Category: {state.get('category', 'unknown')}\n"
+            f"Confidence: {state.get('confidence', 0.0):.2f}\n"
+            f"From: {state.get('sender', 'unknown')}\n"
+            f"Subject: {state.get('subject', 'no subject')}\n"
+            f"Summary: {state.get('summary', '')}"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Approve", "callback_data": f"review:{review_id}:approve"},
+                    {"text": "Reject", "callback_data": f"review:{review_id}:reject"},
+                ]
+            ]
+        }
+        self._telegram_send(text, reply_markup=reply_markup)
+
     def _send_telegram_reply_draft_notice(self, state: EmailState) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
@@ -328,21 +443,39 @@ class GmailProcessor:
         )
         self._telegram_send(text)
 
-    def _telegram_send(self, text: str) -> None:
-        api_base = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
-        data = urllib.parse.urlencode(
-            {
-                "chat_id": self.settings.telegram_chat_id,
-                "text": text,
-            }
-        ).encode("utf-8")
+    def _send_telegram_calendar_placeholder(self, state: EmailState) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Calendar action approved\n"
+            f"Message ID: {state.get('gmail_message_id')}\n"
+            "Calendar event creation handler is queued for next iteration."
+        )
+        self._telegram_send(text)
 
-        request = urllib.request.Request(api_base, data=data, method="POST")
+    def _telegram_send(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
+        api_base = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.settings.telegram_chat_id,
+            "text": text,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        self._telegram_post(api_base, payload)
+
+    def _telegram_post(self, url: str, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(request, timeout=10) as response:
             raw = response.read().decode("utf-8")
-            payload = json.loads(raw)
-            if not payload.get("ok"):
-                logger.warning("Telegram send failed payload=%s", payload)
+            body = json.loads(raw)
+            if not body.get("ok"):
+                logger.warning("Telegram call failed payload=%s response=%s", payload, body)
 
 
 def parse_publish_time(value: str | None) -> str | None:
