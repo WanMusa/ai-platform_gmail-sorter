@@ -65,6 +65,59 @@ stateDiagram-v2
 
 ---
 
+## LangGraph Production Flow
+
+```mermaid
+flowchart TD
+    A[Pub/Sub Webhook Event] --> B[Validate and Decode Payload]
+    B --> C[Idempotency Check]
+    C -->|Duplicate| Z1[Skip and Log Duplicate]
+    C -->|New Event| D[Load Watch State and Last History ID]
+    D --> E[Fetch Gmail History Deltas]
+    E --> F{Any New Messages?}
+    F -->|No| Z2[Persist No-Op and End]
+    F -->|Yes| G[For Each Message Build LangGraph State]
+
+    G --> H[Node Load Message Content]
+    H --> I[Node Classify Category Confidence and Rationale]
+    I --> J[Node Policy Router]
+
+    J --> K{Confidence High?}
+    K -->|No| L[Node Human Review Request via Telegram]
+    K -->|Yes| M{Action Sensitive?}
+    M -->|Yes| L
+    M -->|No| N[Node Execute Safe Actions]
+
+    L --> O{User Decision}
+    O -->|Approve| P[Node Execute Approved Actions]
+    O -->|Reject| Q[Node Mark Rejected]
+    O -->|Override Category| R[Node Re-route by Override]
+
+    R --> J
+    N --> S[Node Persist Outcome and Audit Trail]
+    P --> S
+    Q --> S
+
+    S --> T[Node Emit LangSmith Trace and Metrics]
+    T --> U[Update Checkpoints history_id status retries]
+    U --> V[End]
+
+    Z1 --> V
+    Z2 --> V
+
+    H -. error .-> ER[Persist Error]
+    I -. error .-> ER
+    N -. error .-> ER
+    P -. error .-> ER
+    ER --> RT{Retry Count Less Than Max?}
+    RT -->|Yes| W[Requeue with Backoff]
+    RT -->|No| X[Dead-letter Status and Alert]
+    W --> G
+    X --> V
+```
+
+---
+
 ## LangGraph State Model
 
 ```python

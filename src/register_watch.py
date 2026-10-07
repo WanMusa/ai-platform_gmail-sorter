@@ -57,7 +57,7 @@ def _load_scopes() -> list[str]:
     return [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
 
 
-def _build_gmail_client():
+def build_gmail_client():
     token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="token.json"))
     scopes = _load_scopes()
     creds = _load_credentials(token_path=token_path, scopes=scopes)
@@ -75,7 +75,7 @@ def register_watch() -> dict[str, Any]:
         "GMAIL_WATCH_LABEL_FILTER_BEHAVIOR", default="INCLUDE"
     ).upper()
 
-    gmail = _build_gmail_client()
+    gmail = build_gmail_client()
 
     request_body = {
         "topicName": f"projects/{project_id}/topics/{topic_name}",
@@ -97,7 +97,7 @@ def register_watch_cli() -> None:
 
 
 def stop_watch() -> None:
-    gmail = _build_gmail_client()
+    gmail = build_gmail_client()
 
     gmail.users().stop(userId="me").execute()
     print("Watch stopped")
