@@ -33,9 +33,13 @@ class Settings:
 	retry_max_attempts: int
 
 	google_token_path: str
+	google_oauth_scopes: list[str]
 	gmail_webhook_path: str
 	gmail_label_include: str
 	gmail_label_to_delete: str
+	calendar_id: str
+	calendar_timezone: str
+	calendar_default_duration_minutes: int
 
 	watch_auto_renew: bool
 	watch_renew_interval_seconds: int
@@ -73,9 +77,16 @@ def get_settings() -> Settings:
 		log_level=os.getenv("LOG_LEVEL", "INFO"),
 		retry_max_attempts=_env_int("RETRY_MAX_ATTEMPTS", 2),
 		google_token_path=os.getenv("GOOGLE_TOKEN_PATH", "token.json"),
+		google_oauth_scopes=_env_csv(
+			"GOOGLE_OAUTH_SCOPES",
+			"https://www.googleapis.com/auth/gmail.modify,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/calendar.events",
+		),
 		gmail_webhook_path=os.getenv("GMAIL_WEBHOOK_PATH", "/webhooks/gmail/pubsub"),
 		gmail_label_include=os.getenv("GMAIL_LABEL_INCLUDE", "AI"),
 		gmail_label_to_delete=os.getenv("GMAIL_LABEL_TO_DELETE", "AI/to-delete"),
+		calendar_id=os.getenv("GOOGLE_CALENDAR_ID", "primary"),
+		calendar_timezone=os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Asia/Kuala_Lumpur"),
+		calendar_default_duration_minutes=_env_int("CALENDAR_DEFAULT_DURATION_MINUTES", 60),
 		watch_auto_renew=_env_bool("GMAIL_WATCH_AUTO_RENEW", True),
 		watch_renew_interval_seconds=_env_int("GMAIL_WATCH_RENEW_INTERVAL_SECONDS", 21600),
 		gcp_project_id=os.getenv("GCP_PROJECT_ID", ""),

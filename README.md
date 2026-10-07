@@ -63,3 +63,18 @@ Set webhook with optional secret token:
 ```text
 https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://wanagents.duckdns.org/webhooks/telegram&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 ```
+
+## Calendar Event Creation
+
+When meeting confirmation is approved, the app can create a Google Calendar event.
+
+Required env:
+
+- `GOOGLE_CALENDAR_ID` (default: `primary`)
+- `GOOGLE_CALENDAR_TIMEZONE` (default: `Asia/Kuala_Lumpur`)
+- `CALENDAR_DEFAULT_DURATION_MINUTES` (default: `60`)
+
+Important:
+
+- `GOOGLE_OAUTH_SCOPES` must include `https://www.googleapis.com/auth/calendar.events`.
+- If your token was created before adding this scope, run OAuth again to regenerate `token.json`.

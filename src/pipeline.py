@@ -5,9 +5,12 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import base64
+import re
 from uuid import uuid4
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime, parseaddr
 from typing import Any, TypedDict
 
 from googleapiclient.errors import HttpError
@@ -15,7 +18,7 @@ from langgraph.graph import StateGraph, END
 
 from src.config import Settings
 from src.db import Repo
-from src.register_watch import build_gmail_client
+from src.register_watch import build_gmail_client, build_google_service
 
 logger = logging.getLogger("gmail-sorter")
 
@@ -26,6 +29,9 @@ class EmailState(TypedDict, total=False):
     sender: str
     subject: str
     received_at: str | None
+    thread_id: str
+    sender_email: str
+    message_rfc822_id: str
     snippet: str
     category: str
     confidence: float
@@ -174,7 +180,7 @@ class GmailProcessor:
                 userId="me",
                 id=message_id,
                 format="metadata",
-                metadataHeaders=["From", "Subject", "Date"],
+                metadataHeaders=["From", "Subject", "Date", "Message-ID"],
             )
             .execute()
         )
@@ -196,8 +202,11 @@ class GmailProcessor:
             gmail_message_id=message_id,
             history_id=history_id,
             sender=headers.get("From", "Unknown"),
+            sender_email=parseaddr(headers.get("From", ""))[1],
             subject=headers.get("Subject", "No Subject"),
             received_at=received_at,
+            thread_id=message.get("threadId", ""),
+            message_rfc822_id=headers.get("Message-ID", ""),
             snippet=message.get("snippet", ""),
             executed_actions=[],
             status="processing",
@@ -405,6 +414,7 @@ class GmailProcessor:
         state = EmailState(**state_payload)
         state["reply_instruction_text"] = text.strip()
 
+        state = self._execute_actions(state, allow_sensitive=True)
         self._send_telegram_manual_reply_capture_notice(state)
         state["status"] = "approved_and_processed"
         self.repo.resolve_pending_review(review_id, "approved", decision_by)
@@ -436,11 +446,15 @@ class GmailProcessor:
                 self._send_telegram_summary(state, requires_review=False)
                 executed.append(action)
             elif action == "draft_reply":
-                self._send_telegram_reply_draft_notice(state)
+                result = self._handle_reply_action(state)
+                if result:
+                    executed.append(result)
                 executed.append(action)
             elif action == "create_calendar_event":
-                self._send_telegram_calendar_placeholder(state)
-                executed.append(action)
+                event_result = self._create_calendar_event(state)
+                if event_result:
+                    executed.append("calendar_event_created")
+                    executed.append(action)
 
         state["executed_actions"] = executed
         return state
@@ -523,13 +537,235 @@ class GmailProcessor:
         )
         self._telegram_send(text)
 
-    def _send_telegram_calendar_placeholder(self, state: EmailState) -> None:
+    def _handle_reply_action(self, state: EmailState) -> str | None:
+        reply_text = state.get("reply_instruction_text", "").strip()
+        if reply_text:
+            sent_id = self._send_gmail_reply(state, reply_text)
+            if sent_id:
+                self._send_telegram_reply_sent_notice(state, sent_id)
+                return "reply_sent"
+            return None
+
+        draft_text = self._build_default_reply_text(state)
+        draft_id = self._create_gmail_reply_draft(state, draft_text)
+        if draft_id:
+            self._send_telegram_reply_draft_notice(state)
+            self._send_telegram_draft_created_notice(state, draft_id)
+            return "reply_draft_created"
+        return None
+
+    def _build_default_reply_text(self, state: EmailState) -> str:
+        return (
+            "Thanks for your email.\n\n"
+            "I have reviewed your message and will get back to you shortly.\n\n"
+            "Best regards"
+        )
+
+    def _create_gmail_reply_draft(self, state: EmailState, reply_text: str) -> str | None:
+        gmail = build_gmail_client()
+        sender_email = state.get("sender_email", "")
+        if not sender_email:
+            return None
+
+        mime = MIMEText(reply_text)
+        mime["to"] = sender_email
+        mime["subject"] = self._reply_subject(state.get("subject", ""))
+        if state.get("message_rfc822_id"):
+            mime["In-Reply-To"] = state["message_rfc822_id"]
+            mime["References"] = state["message_rfc822_id"]
+
+        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+        response = (
+            gmail.users()
+            .drafts()
+            .create(
+                userId="me",
+                body={
+                    "message": {
+                        "raw": raw,
+                        "threadId": state.get("thread_id", ""),
+                    }
+                },
+            )
+            .execute()
+        )
+        return response.get("id")
+
+    def _send_gmail_reply(self, state: EmailState, reply_text: str) -> str | None:
+        gmail = build_gmail_client()
+        sender_email = state.get("sender_email", "")
+        if not sender_email:
+            return None
+
+        mime = MIMEText(reply_text)
+        mime["to"] = sender_email
+        mime["subject"] = self._reply_subject(state.get("subject", ""))
+        if state.get("message_rfc822_id"):
+            mime["In-Reply-To"] = state["message_rfc822_id"]
+            mime["References"] = state["message_rfc822_id"]
+
+        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+        response = (
+            gmail.users()
+            .messages()
+            .send(
+                userId="me",
+                body={
+                    "raw": raw,
+                    "threadId": state.get("thread_id", ""),
+                },
+            )
+            .execute()
+        )
+        return response.get("id")
+
+    def _reply_subject(self, subject: str) -> str:
+        clean = subject.strip()
+        if clean.lower().startswith("re:"):
+            return clean
+        return f"Re: {clean}"
+
+    def _send_telegram_draft_created_notice(self, state: EmailState, draft_id: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
         text = (
-            "Calendar action approved\n"
+            "Draft created\n"
             f"Message ID: {state.get('gmail_message_id')}\n"
-            "Calendar event creation handler is queued for next iteration."
+            f"Draft ID: {draft_id}"
+        )
+        self._telegram_send(text)
+
+    def _send_telegram_reply_sent_notice(self, state: EmailState, sent_message_id: str) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Reply sent\n"
+            f"Message ID: {state.get('gmail_message_id')}\n"
+            f"Sent Message ID: {sent_message_id}"
+        )
+        self._telegram_send(text)
+
+    def _create_calendar_event(self, state: EmailState) -> str | None:
+        event_window = self._infer_event_window(state)
+        if not event_window:
+            self._send_telegram_calendar_parse_failed(state)
+            return None
+
+        start_dt, end_dt = event_window
+        calendar = build_google_service("calendar", "v3")
+
+        event = {
+            "summary": state.get("subject", "Meeting"),
+            "description": (
+                f"From: {state.get('sender', 'unknown')}\n"
+                f"Summary: {state.get('summary', '')}\n"
+                f"Gmail Message ID: {state.get('gmail_message_id', '')}"
+            ),
+            "start": {
+                "dateTime": start_dt.isoformat(),
+                "timeZone": self.settings.calendar_timezone,
+            },
+            "end": {
+                "dateTime": end_dt.isoformat(),
+                "timeZone": self.settings.calendar_timezone,
+            },
+        }
+
+        response = (
+            calendar.events()
+            .insert(calendarId=self.settings.calendar_id, body=event, sendUpdates="none")
+            .execute()
+        )
+
+        event_id = response.get("id")
+        event_link = response.get("htmlLink", "")
+        self._send_telegram_calendar_created_notice(state, event_id or "", event_link)
+        return event_id
+
+    def _infer_event_window(self, state: EmailState) -> tuple[datetime, datetime] | None:
+        text = f"{state.get('subject', '')} {state.get('snippet', '')}".lower()
+        base_dt = datetime.now(timezone.utc)
+        if state.get("received_at"):
+            try:
+                base_dt = datetime.fromisoformat(str(state["received_at"]))
+            except ValueError:
+                pass
+
+        weekday_map = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+
+        target_date = None
+        for day_name, day_idx in weekday_map.items():
+            if day_name in text:
+                delta = (day_idx - base_dt.weekday()) % 7
+                if delta == 0:
+                    delta = 7
+                target_date = (base_dt + timedelta(days=delta)).date()
+                break
+
+        date_match = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+        if date_match:
+            try:
+                target_date = datetime.strptime(date_match.group(1), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text)
+        hour = None
+        minute = 0
+        if time_match:
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2) or 0)
+            ampm = time_match.group(3)
+            if ampm == "pm" and hour != 12:
+                hour += 12
+            if ampm == "am" and hour == 12:
+                hour = 0
+
+        if target_date is None or hour is None:
+            return None
+
+        start = datetime(
+            year=target_date.year,
+            month=target_date.month,
+            day=target_date.day,
+            hour=hour,
+            minute=minute,
+            tzinfo=timezone.utc,
+        )
+        end = start + timedelta(minutes=self.settings.calendar_default_duration_minutes)
+        return start, end
+
+    def _send_telegram_calendar_created_notice(
+        self,
+        state: EmailState,
+        event_id: str,
+        event_link: str,
+    ) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Calendar event created\n"
+            f"Message ID: {state.get('gmail_message_id')}\n"
+            f"Event ID: {event_id}\n"
+            f"Link: {event_link}"
+        )
+        self._telegram_send(text)
+
+    def _send_telegram_calendar_parse_failed(self, state: EmailState) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Calendar event not created\n"
+            "I could not confidently extract meeting date/time from this email.\n"
+            f"Subject: {state.get('subject', 'no subject')}"
         )
         self._telegram_send(text)
 

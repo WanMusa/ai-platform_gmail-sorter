@@ -57,11 +57,15 @@ def _load_scopes() -> list[str]:
     return [scope.strip() for scope in scopes_raw.split(",") if scope.strip()]
 
 
-def build_gmail_client():
+def build_google_service(service_name: str, version: str):
     token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="token.json"))
     scopes = _load_scopes()
     creds = _load_credentials(token_path=token_path, scopes=scopes)
-    return build("gmail", "v1", credentials=creds)
+    return build(service_name, version, credentials=creds)
+
+
+def build_gmail_client():
+    return build_google_service("gmail", "v1")
 
 
 def register_watch() -> dict[str, Any]:
