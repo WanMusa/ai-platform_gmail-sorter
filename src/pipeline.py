@@ -43,6 +43,7 @@ class GmailProcessor:
         self._graph = self._build_graph()
 
     def process_pubsub_event(self, event_id: int, decoded_payload: dict[str, Any]) -> None:
+        logger.info("Processing inbox event id=%s payload=%s", event_id, decoded_payload)
         self.repo.update_inbox_event_status(event_id, "processing")
 
         incoming_history_id = str(decoded_payload.get("historyId") or "")
@@ -54,13 +55,31 @@ class GmailProcessor:
         if not last_history_id:
             self.repo.set_watch_state("last_history_id", incoming_history_id)
             self.repo.update_inbox_event_status(event_id, "checkpoint_initialized")
+            logger.info(
+                "Initialized history checkpoint event_id=%s history_id=%s",
+                event_id,
+                incoming_history_id,
+            )
             return
 
         message_ids = self._fetch_changed_message_ids(last_history_id)
         if not message_ids:
             self.repo.set_watch_state("last_history_id", incoming_history_id)
             self.repo.update_inbox_event_status(event_id, "no_messages")
+            logger.info(
+                "No new messageAdded records event_id=%s from_history_id=%s to_history_id=%s",
+                event_id,
+                last_history_id,
+                incoming_history_id,
+            )
             return
+
+        logger.info(
+            "Found %s changed message(s) event_id=%s from_history_id=%s",
+            len(message_ids),
+            event_id,
+            last_history_id,
+        )
 
         for message_id in message_ids:
             try:
@@ -87,6 +106,14 @@ class GmailProcessor:
                         "executed_actions": final_state.get("executed_actions", []),
                         "needs_human_review": final_state.get("needs_human_review", False),
                     },
+                )
+                logger.info(
+                    "Graph complete message_id=%s category=%s confidence=%.2f status=%s actions=%s",
+                    final_state["gmail_message_id"],
+                    final_state.get("category", "others"),
+                    float(final_state.get("confidence", 0.0)),
+                    final_state.get("status", "processed"),
+                    final_state.get("executed_actions", []),
                 )
             except Exception as exc:  # pragma: no cover
                 logger.exception("Failed processing message %s: %s", message_id, exc)
@@ -232,6 +259,8 @@ class GmailProcessor:
         elif category == "action_required":
             proposed.extend(["summarize", "draft_reply"])
         elif category == "information":
+            proposed.append("summarize")
+        else:
             proposed.append("summarize")
 
         needs_review = confidence < self.settings.confidence_threshold
