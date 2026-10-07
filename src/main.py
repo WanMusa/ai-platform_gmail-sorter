@@ -12,6 +12,16 @@ logger = logging.getLogger("gmail-sorter")
 app = FastAPI(title="gmail-sorter", version="0.1.0")
 
 
+@app.get("/")
+async def root() -> dict:
+    return {
+        "service": "gmail-sorter",
+        "status": "ok",
+        "health": "/healthz",
+        "webhook": "/webhooks/gmail/pubsub",
+    }
+
+
 @app.get("/healthz")
 async def healthz() -> dict:
     return {
