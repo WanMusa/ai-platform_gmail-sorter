@@ -58,7 +58,7 @@ def _load_scopes() -> list[str]:
 
 
 def _build_gmail_client():
-    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="local/token.json"))
+    token_path = Path(_read_env("GOOGLE_TOKEN_PATH", default="token.json"))
     scopes = _load_scopes()
     creds = _load_credentials(token_path=token_path, scopes=scopes)
     return build("gmail", "v1", credentials=creds)

@@ -17,6 +17,7 @@ services:
 
     volumes:
       - ./data:/app/data
+      - ./token.json:/app/token.json
     
     networks:
       - ai_platform

@@ -21,7 +21,9 @@ After OAuth token setup, register Gmail webhook watch locally:
 	- `GCP_PROJECT_ID`
 	- `GMAIL_PUBSUB_TOPIC`
 	- `GMAIL_WATCH_LABEL_IDS` (recommended: `INBOX`)
-2. Run watch registration:
+2. Put OAuth token at repo root as `token.json` (or set `GOOGLE_TOKEN_PATH` to a custom path).
+   In Docker deployment, `./token.json` is mounted to `/app/token.json`.
+3. Run watch registration:
 
 ```powershell
 python -m src.register_watch register
