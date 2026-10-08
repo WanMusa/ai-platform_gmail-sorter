@@ -8,10 +8,12 @@ import urllib.request
 import base64
 import re
 import threading
+from collections import defaultdict
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime, parseaddr
+from pathlib import Path
 from typing import Any, TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -51,8 +53,47 @@ class GmailProcessor:
         self.settings = settings
         self.repo = repo
         self._label_cache: dict[str, str] = {}
+        self._prompt_templates = self._load_prompt_templates()
         self._processing_lock = threading.Lock()
         self._graph = self._build_graph()
+
+    def _load_prompt_templates(self) -> dict[str, str]:
+        prompts_path = Path(__file__).with_name("prompts.md")
+        try:
+            raw = prompts_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Unable to load prompt templates from %s: %s", prompts_path, exc)
+            return {}
+
+        templates: dict[str, str] = {}
+        current_key: str | None = None
+        lines: list[str] = []
+
+        for line in raw.splitlines():
+            if line.startswith("## "):
+                if current_key:
+                    templates[current_key] = "\n".join(lines).strip()
+                current_key = line[3:].strip()
+                lines = []
+                continue
+
+            if current_key is not None:
+                lines.append(line)
+
+        if current_key:
+            templates[current_key] = "\n".join(lines).strip()
+
+        return templates
+
+    def _render_prompt(self, key: str, fallback: str, **values: Any) -> str:
+        template = self._prompt_templates.get(key, fallback).strip()
+        safe_values: defaultdict[str, Any] = defaultdict(str)
+        safe_values.update(values)
+
+        try:
+            return template.format_map(safe_values)
+        except Exception:
+            return fallback.format_map(safe_values)
 
     def process_pubsub_event(self, event_id: int, decoded_payload: dict[str, Any]) -> None:
         with self._processing_lock:
@@ -246,22 +287,60 @@ class GmailProcessor:
         subject = state.get("subject", "").lower()
         snippet = state.get("snippet", "").lower()
         sender = state.get("sender", "").lower()
+        sender_email = state.get("sender_email", "").lower()
+        text = f"{subject} {snippet}"
 
         category = "others"
         confidence = 0.70
 
-        if any(token in subject for token in ["meeting", "invite", "calendar"]):
-            category = "meeting"
-            confidence = 0.90
-        elif any(token in subject for token in ["newsletter", "sale", "promo", "discount"]):
+        marketing_tokens = [
+            "newsletter",
+            "sale",
+            "promo",
+            "promotion",
+            "discount",
+            "limited time",
+            "coupon",
+            "unsubscribe",
+            "offer",
+        ]
+        meeting_tokens = [
+            "meeting",
+            "invite",
+            "calendar",
+            "schedule",
+            "appointment",
+            "friday",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "saturday",
+            "sunday",
+        ]
+        action_tokens = ["please", "can you", "could you", "need", "action required", "respond"]
+        info_sender_tokens = ["noreply", "no-reply", "notification", "donotreply"]
+
+        has_explicit_time = bool(re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", text))
+        has_meeting_token = any(token in text for token in meeting_tokens)
+
+        if any(token in text for token in marketing_tokens):
             category = "marketing"
-            confidence = 0.88
-        elif "?" in state.get("subject", "") or "please" in snippet:
+            confidence = 0.93
+        elif has_meeting_token and (has_explicit_time or " at " in text or "harbour" in text):
+            category = "meeting"
+            confidence = 0.94
+        elif has_meeting_token:
+            category = "meeting"
+            confidence = 0.85
+        elif "?" in state.get("subject", "") or any(token in text for token in action_tokens):
             category = "action_required"
-            confidence = 0.82
-        elif "noreply" in sender or "notification" in subject:
+            confidence = 0.84
+        elif any(token in sender for token in info_sender_tokens) or any(
+            token in sender_email for token in info_sender_tokens
+        ):
             category = "information"
-            confidence = 0.80
+            confidence = 0.86
 
         summary = self._summarize_text(state.get("subject", ""), state.get("snippet", ""))
 
@@ -364,6 +443,26 @@ class GmailProcessor:
             self._persist_state_after_review(state, review_id, decision_by, "review_category_override")
             return f"Category updated to {action_value}. Actions executed"
 
+        if action_type == "catreply":
+            state["category"] = "action_required"
+            state["confidence"] = 1.0
+            state = self._apply_category_override(state)
+            self.repo.update_pending_review_payload(review_id, dict(state))
+
+            if action_value == "draft":
+                state = self._execute_actions(state, allow_sensitive=False)
+                state["status"] = "approved_and_processed"
+                self.repo.resolve_pending_review(review_id, "approved", decision_by)
+                self._persist_state_after_review(state, review_id, decision_by, "review_reply_draft")
+                return "Action category selected. Draft reply flow approved"
+
+            if action_value == "manual":
+                self.repo.set_pending_review_status(review_id, "awaiting_reply_text", decision_by)
+                self._send_reply_text_prompt(state)
+                return "Action category selected. Send the exact reply text in your next message"
+
+            return "Unknown action-required shortcut"
+
         if action_type == "reply":
             if action_value == "draft":
                 state = self._execute_actions(state, allow_sensitive=False)
@@ -456,7 +555,14 @@ class GmailProcessor:
                 self._apply_marketing_labels(state["gmail_message_id"])
                 executed.append(action)
             elif action == "summarize":
-                self._send_telegram_summary(state, requires_review=False)
+                if self._should_notify(state):
+                    self._send_telegram_summary(state, requires_review=False)
+                else:
+                    logger.info(
+                        "Skipping Telegram summary for category=%s message_id=%s",
+                        state.get("category", "unknown"),
+                        state.get("gmail_message_id", ""),
+                    )
                 executed.append(action)
             elif action == "draft_reply":
                 result = self._handle_reply_action(state)
@@ -527,17 +633,40 @@ class GmailProcessor:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
 
-        review_line = "\nReview required: yes" if requires_review else "\nReview required: no"
-        text = (
-            f"Gmail update\n"
-            f"Category: {state.get('category', 'unknown')}\n"
-            f"Confidence: {state.get('confidence', 0.0):.2f}\n"
-            f"From: {state.get('sender', 'unknown')}\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            f"Summary: {state.get('summary', '')}"
-            f"{review_line}"
+        text = self._render_prompt(
+            "telegram_summary",
+            (
+                "Gmail update\n"
+                "Category: {category}\n"
+                "Confidence: {confidence:.2f}\n"
+                "From: {sender}\n"
+                "Subject: {subject}\n"
+                "Summary: {summary}\n"
+                "Review required: {review_required}"
+            ),
+            category=state.get("category", "unknown"),
+            confidence=float(state.get("confidence", 0.0)),
+            sender=state.get("sender", "unknown"),
+            subject=state.get("subject", "no subject"),
+            summary=state.get("summary", ""),
+            review_required="yes" if requires_review else "no",
         )
         self._telegram_send(text)
+
+    def _should_notify(self, state: EmailState) -> bool:
+        if state.get("needs_human_review"):
+            return True
+
+        allowed_categories = {
+            category.strip().lower()
+            for category in self.settings.telegram_notify_categories
+            if category.strip()
+        }
+        if not allowed_categories:
+            return True
+
+        category = str(state.get("category", "")).strip().lower()
+        return category in allowed_categories
 
     def _send_telegram_review_request(self, state: EmailState, review_id: str, review_type: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
@@ -560,10 +689,11 @@ class GmailProcessor:
     def _send_telegram_reply_draft_notice(self, state: EmailState) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Reply draft suggested\n"
-            f"Message ID: {state.get('gmail_message_id')}\n"
-            f"Subject: {state.get('subject', 'no subject')}"
+        text = self._render_prompt(
+            "reply_draft_notice",
+            "Reply draft suggested\nMessage ID: {gmail_message_id}\nSubject: {subject}",
+            gmail_message_id=state.get("gmail_message_id", ""),
+            subject=state.get("subject", "no subject"),
         )
         self._telegram_send(text)
 
@@ -658,20 +788,22 @@ class GmailProcessor:
     def _send_telegram_draft_created_notice(self, state: EmailState, draft_id: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Draft created\n"
-            f"Message ID: {state.get('gmail_message_id')}\n"
-            f"Draft ID: {draft_id}"
+        text = self._render_prompt(
+            "draft_created_notice",
+            "Draft created\nMessage ID: {gmail_message_id}\nDraft ID: {draft_id}",
+            gmail_message_id=state.get("gmail_message_id", ""),
+            draft_id=draft_id,
         )
         self._telegram_send(text)
 
     def _send_telegram_reply_sent_notice(self, state: EmailState, sent_message_id: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Reply sent\n"
-            f"Message ID: {state.get('gmail_message_id')}\n"
-            f"Sent Message ID: {sent_message_id}"
+        text = self._render_prompt(
+            "reply_sent_notice",
+            "Reply sent\nMessage ID: {gmail_message_id}\nSent Message ID: {sent_message_id}",
+            gmail_message_id=state.get("gmail_message_id", ""),
+            sent_message_id=sent_message_id,
         )
         self._telegram_send(text)
 
@@ -817,88 +949,118 @@ class GmailProcessor:
     ) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Calendar event created\n"
-            f"Message ID: {state.get('gmail_message_id')}\n"
-            f"Event ID: {event_id}\n"
-            f"Link: {event_link}"
+        text = self._render_prompt(
+            "calendar_created_notice",
+            "Calendar event created\nMessage ID: {gmail_message_id}\nEvent ID: {event_id}\nLink: {event_link}",
+            gmail_message_id=state.get("gmail_message_id", ""),
+            event_id=event_id,
+            event_link=event_link,
         )
         self._telegram_send(text)
 
     def _send_telegram_calendar_parse_failed(self, state: EmailState) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Calendar event not created\n"
-            "I could not confidently extract meeting date/time from this email.\n"
-            f"Subject: {state.get('subject', 'no subject')}"
+        text = self._render_prompt(
+            "calendar_parse_failed",
+            (
+                "Calendar event not created\n"
+                "I could not confidently extract meeting date/time from this email.\n"
+                "Subject: {subject}"
+            ),
+            subject=state.get("subject", "no subject"),
         )
         self._telegram_send(text)
 
     def _send_telegram_calendar_api_failed(self, state: EmailState, error: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Calendar event creation failed\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            f"Error: {error}"
+        text = self._render_prompt(
+            "calendar_api_failed",
+            "Calendar event creation failed\nSubject: {subject}\nError: {error}",
+            subject=state.get("subject", "no subject"),
+            error=error,
         )
         self._telegram_send(text)
 
     def _send_telegram_calendar_scope_failed(self, state: EmailState) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Calendar event creation failed\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            "Reason: OAuth token lacks calendar.events scope.\n"
-            "Action: regenerate token.json with GOOGLE_OAUTH_SCOPES including "
-            "https://www.googleapis.com/auth/calendar.events and redeploy."
+        text = self._render_prompt(
+            "calendar_scope_failed",
+            (
+                "Calendar event creation failed\n"
+                "Subject: {subject}\n"
+                "Reason: OAuth token lacks calendar.events scope.\n"
+                "Action: regenerate token.json with GOOGLE_OAUTH_SCOPES including "
+                "https://www.googleapis.com/auth/calendar.events and redeploy."
+            ),
+            subject=state.get("subject", "no subject"),
         )
         self._telegram_send(text)
 
     def _send_telegram_manual_reply_capture_notice(self, state: EmailState) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
-        text = (
-            "Reply text captured\n"
-            f"Message ID: {state.get('gmail_message_id')}\n"
-            f"Reply: {state.get('reply_instruction_text', '')}"
+        text = self._render_prompt(
+            "manual_reply_capture_notice",
+            "Reply text captured\nMessage ID: {gmail_message_id}\nReply: {reply_instruction_text}",
+            gmail_message_id=state.get("gmail_message_id", ""),
+            reply_instruction_text=state.get("reply_instruction_text", ""),
         )
         self._telegram_send(text)
 
     def _send_category_selection_request(self, state: EmailState, review_id: str) -> None:
-        text = (
-            "Low confidence classification\n"
-            f"From: {state.get('sender', 'unknown')}\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            f"Summary: {state.get('summary', '')}\n\n"
-            "Select the correct category:"
+        text = self._render_prompt(
+            "category_selection_request",
+            (
+                "Low confidence classification\n"
+                "From: {sender}\n"
+                "Subject: {subject}\n"
+                "Summary: {summary}\n\n"
+                "Select the correct category:"
+            ),
+            sender=state.get("sender", "unknown"),
+            subject=state.get("subject", "no subject"),
+            summary=state.get("summary", ""),
         )
         reply_markup = {
             "inline_keyboard": [
                 [
                     {"text": "Information", "callback_data": f"review:{review_id}:cat:information"},
-                    {"text": "Action", "callback_data": f"review:{review_id}:cat:action_required"},
-                ],
-                [
                     {"text": "Meeting", "callback_data": f"review:{review_id}:cat:meeting"},
-                    {"text": "Marketing", "callback_data": f"review:{review_id}:cat:marketing"},
                 ],
                 [
+                    {"text": "Marketing", "callback_data": f"review:{review_id}:cat:marketing"},
                     {"text": "Other", "callback_data": f"review:{review_id}:cat:others"},
+                ],
+                [
+                    {
+                        "text": "Action -> Draft",
+                        "callback_data": f"review:{review_id}:catreply:draft",
+                    },
+                    {
+                        "text": "Action -> Type Reply",
+                        "callback_data": f"review:{review_id}:catreply:manual",
+                    },
                 ],
             ]
         }
         self._telegram_send(text, reply_markup=reply_markup)
 
     def _send_reply_mode_request(self, state: EmailState, review_id: str) -> None:
-        text = (
-            "Action required email\n"
-            f"From: {state.get('sender', 'unknown')}\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            f"Summary: {state.get('summary', '')}\n\n"
-            "How should I handle the reply?"
+        text = self._render_prompt(
+            "reply_mode_request",
+            (
+                "Action required email\n"
+                "From: {sender}\n"
+                "Subject: {subject}\n"
+                "Summary: {summary}\n\n"
+                "How should I handle the reply?"
+            ),
+            sender=state.get("sender", "unknown"),
+            subject=state.get("subject", "no subject"),
+            summary=state.get("summary", ""),
         )
         reply_markup = {
             "inline_keyboard": [
@@ -906,20 +1068,23 @@ class GmailProcessor:
                     {"text": "Draft Reply", "callback_data": f"review:{review_id}:reply:draft"},
                     {"text": "I will type reply", "callback_data": f"review:{review_id}:reply:manual"},
                 ],
-                [
-                    {"text": "Skip reply", "callback_data": f"review:{review_id}:reply:skip"},
-                ],
             ]
         }
         self._telegram_send(text, reply_markup=reply_markup)
 
     def _send_meeting_confirmation_request(self, state: EmailState, review_id: str) -> None:
-        text = (
-            "Meeting email detected\n"
-            f"From: {state.get('sender', 'unknown')}\n"
-            f"Subject: {state.get('subject', 'no subject')}\n"
-            f"Summary: {state.get('summary', '')}\n\n"
-            "Confirm appointment and create calendar event?"
+        text = self._render_prompt(
+            "meeting_confirmation_request",
+            (
+                "Meeting email detected\n"
+                "From: {sender}\n"
+                "Subject: {subject}\n"
+                "Summary: {summary}\n\n"
+                "Confirm appointment and create calendar event?"
+            ),
+            sender=state.get("sender", "unknown"),
+            subject=state.get("subject", "no subject"),
+            summary=state.get("summary", ""),
         )
         reply_markup = {
             "inline_keyboard": [
@@ -932,9 +1097,10 @@ class GmailProcessor:
         self._telegram_send(text, reply_markup=reply_markup)
 
     def _send_reply_text_prompt(self, state: EmailState) -> None:
-        text = (
-            "Please send the exact reply text in your next message.\n"
-            f"Subject: {state.get('subject', 'no subject')}"
+        text = self._render_prompt(
+            "reply_text_prompt",
+            "Please send the exact reply text in your next message.\nSubject: {subject}",
+            subject=state.get("subject", "no subject"),
         )
         self._telegram_send(text)
 

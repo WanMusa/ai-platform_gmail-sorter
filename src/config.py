@@ -55,6 +55,7 @@ class Settings:
 
 	auto_actions: list[str]
 	approval_required_actions: list[str]
+	telegram_notify_categories: list[str]
 	confidence_threshold: float
 
 	db_host: str
@@ -103,6 +104,9 @@ def get_settings() -> Settings:
 		),
 		approval_required_actions=_env_csv(
 			"APPROVAL_REQUIRED_ACTIONS", "send_reply,create_calendar_event,delete"
+		),
+		telegram_notify_categories=_env_csv(
+			"TELEGRAM_NOTIFY_CATEGORIES", "meeting,action_required"
 		),
 		confidence_threshold=confidence,
 		db_host=os.getenv("DATABASE_HOST", "postgres"),
