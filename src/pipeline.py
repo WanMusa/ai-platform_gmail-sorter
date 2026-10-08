@@ -304,8 +304,18 @@ class GmailProcessor:
             state.update(llm_decision)
             return state
 
-        fallback = self._classify_with_rules(state)
-        state.update(fallback)
+        # Fail closed: if the LLM is unavailable/invalid, require explicit human review
+        # instead of silently replacing model behavior with deterministic classification.
+        state.update(
+            {
+                "category": "others",
+                "confidence": 0.0,
+                "summary": self._summarize_text(state.get("subject", ""), state.get("snippet", "")),
+                "proposed_actions": ["summarize"],
+                "needs_human_review": True,
+                "review_type": "category_select",
+            }
+        )
         return state
 
     def _classify_with_llm(self, state: EmailState) -> dict[str, Any] | None:
@@ -378,26 +388,19 @@ class GmailProcessor:
                     actions.append(action)
 
         if not actions:
-            actions = self._default_actions_for_category(category)
+            actions = ["summarize"]
 
         # Guardrail: avoid calendar action when no plausible meeting time context is present.
         if "create_calendar_event" in actions and not self._infer_event_window(state):
             actions = [action for action in actions if action != "create_calendar_event"]
+            if category == "meeting" and "summarize" not in actions:
+                actions.append("summarize")
 
         review_type = str(parsed.get("review_type", "")).strip().lower()
         if review_type not in valid_review_types:
-            if category == "action_required":
-                review_type = "reply_mode"
-            elif category == "meeting":
-                review_type = "meeting_confirm"
-            else:
-                review_type = "none"
+            review_type = "none"
 
-        needs_human_review = bool(parsed.get("needs_human_review", False))
-        if category in {"action_required", "meeting"}:
-            needs_human_review = True
-        if review_type == "none" and needs_human_review:
-            review_type = "category_select"
+        needs_human_review = bool(parsed.get("needs_human_review", review_type != "none"))
         if review_type != "none":
             needs_human_review = True
 
@@ -410,110 +413,12 @@ class GmailProcessor:
             "review_type": review_type,
         }
 
-    def _classify_with_rules(self, state: EmailState) -> dict[str, Any]:
-        subject = state.get("subject", "").lower()
-        snippet = state.get("snippet", "").lower()
-        sender = state.get("sender", "").lower()
-        sender_email = state.get("sender_email", "").lower()
-        text = f"{subject} {snippet}"
-
-        category = "others"
-        confidence = 0.70
-
-        marketing_tokens = [
-            "newsletter",
-            "sale",
-            "promo",
-            "promotion",
-            "discount",
-            "limited time",
-            "coupon",
-            "unsubscribe",
-            "offer",
-        ]
-        meeting_tokens = [
-            "meeting",
-            "invite",
-            "calendar",
-            "schedule",
-            "appointment",
-            "friday",
-            "monday",
-            "tuesday",
-            "wednesday",
-            "thursday",
-            "saturday",
-            "sunday",
-        ]
-        action_tokens = ["please", "can you", "could you", "need", "action required", "respond"]
-        info_sender_tokens = ["noreply", "no-reply", "notification", "donotreply"]
-        transactional_info_tokens = [
-            "tracking number",
-            "package posted",
-            "order shipped",
-            "shipping update",
-            "delivery update",
-            "your package",
-            "has been posted",
-            "receipt",
-            "invoice",
-            "payment received",
-            "statement",
-            "order confirmation",
-        ]
-
-        has_explicit_time = bool(re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", text))
-        has_meeting_token = any(token in text for token in meeting_tokens)
-        has_transactional_info = any(token in text for token in transactional_info_tokens)
-        has_action_signal = "?" in state.get("subject", "") or any(
-            token in text for token in action_tokens
-        )
-
-        if has_transactional_info and not has_action_signal:
-            category = "information"
-            confidence = 0.95
-        elif has_meeting_token and (has_explicit_time or " at " in text or "harbour" in text):
-            category = "meeting"
-            confidence = 0.94
-        elif has_meeting_token:
-            category = "meeting"
-            confidence = 0.85
-        elif has_action_signal:
-            category = "action_required"
-            confidence = 0.84
-        elif any(token in sender for token in info_sender_tokens) or any(
-            token in sender_email for token in info_sender_tokens
-        ):
-            category = "information"
-            confidence = 0.86
-        elif any(token in text for token in marketing_tokens):
-            category = "marketing"
-            confidence = 0.93
-
-        return {
-            "category": category,
-            "confidence": confidence,
-            "summary": self._summarize_text(state.get("subject", ""), state.get("snippet", "")),
-        }
-
-    def _default_actions_for_category(self, category: str) -> list[str]:
-        if category == "marketing":
-            return ["label_marketing"]
-        if category == "meeting":
-            return ["summarize", "create_calendar_event"]
-        if category == "action_required":
-            return ["summarize", "draft_reply"]
-        if category == "information":
-            return ["summarize"]
-        return ["summarize"]
-
     def _node_route(self, state: EmailState) -> EmailState:
-        category = state.get("category", "others")
         confidence = float(state.get("confidence", 0.0))
 
         proposed = [action for action in state.get("proposed_actions", []) if isinstance(action, str)]
         if not proposed:
-            proposed = self._default_actions_for_category(category)
+            proposed = ["summarize"]
 
         review_type = str(state.get("review_type", "none"))
         needs_review = bool(state.get("needs_human_review", False))
@@ -521,13 +426,6 @@ class GmailProcessor:
         if confidence < self.settings.confidence_threshold and not needs_review:
             needs_review = True
             review_type = "category_select"
-
-        if category == "action_required" and review_type == "none":
-            needs_review = True
-            review_type = "reply_mode"
-        elif category == "meeting" and review_type == "none":
-            needs_review = True
-            review_type = "meeting_confirm"
 
         if review_type != "none":
             needs_review = True

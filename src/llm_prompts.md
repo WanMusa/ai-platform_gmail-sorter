@@ -13,7 +13,9 @@ Rules:
 - Prioritize true intent over signature/footer noise.
 - Transaction/status updates (shipping, package posted, tracking, receipt, confirmation) are usually information.
 - If the email asks for a response or decision, category is action_required.
-- If a meeting is discussed, category is meeting. Only include create_calendar_event when date/time context exists.
+- Mentioning a possible future meeting is not enough to classify as meeting.
+- Classify as meeting only when there is an actual scheduling intent or commitment, and preferably concrete date/time context.
+- Only include create_calendar_event when date/time context exists.
 - Marketing/promotional content should be marketing.
 - Keep confidence between 0.0 and 1.0.
 - Keep summary concise in one sentence.
