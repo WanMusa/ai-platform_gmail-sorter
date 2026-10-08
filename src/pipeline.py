@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 import base64
 import re
+import threading
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -49,9 +50,14 @@ class GmailProcessor:
         self.settings = settings
         self.repo = repo
         self._label_cache: dict[str, str] = {}
+        self._processing_lock = threading.Lock()
         self._graph = self._build_graph()
 
     def process_pubsub_event(self, event_id: int, decoded_payload: dict[str, Any]) -> None:
+        with self._processing_lock:
+            self._process_pubsub_event_locked(event_id, decoded_payload)
+
+    def _process_pubsub_event_locked(self, event_id: int, decoded_payload: dict[str, Any]) -> None:
         logger.info("Processing inbox event id=%s payload=%s", event_id, decoded_payload)
         self.repo.update_inbox_event_status(event_id, "processing")
 
@@ -91,6 +97,10 @@ class GmailProcessor:
         )
 
         for message_id in message_ids:
+            if self.repo.has_processed_email(message_id):
+                logger.info("Skipping already processed message_id=%s", message_id)
+                continue
+
             try:
                 state = self._load_message_state(message_id, incoming_history_id)
                 final_state = self._graph.invoke(state)
@@ -382,7 +392,9 @@ class GmailProcessor:
                 state["status"] = "approved_and_processed"
                 self.repo.resolve_pending_review(review_id, "approved", decision_by)
                 self._persist_state_after_review(state, review_id, decision_by, "review_meeting_approved")
-                return "Meeting confirmed. Calendar action triggered"
+                if "calendar_event_created" in state.get("executed_actions", []):
+                    return "Meeting confirmed. Calendar event created"
+                return "Meeting confirmed, but event was not created (date/time may be unclear)"
 
             if action_value == "no":
                 state["proposed_actions"] = [
@@ -669,35 +681,55 @@ class GmailProcessor:
             return None
 
         start_dt, end_dt = event_window
-        calendar = build_google_service("calendar", "v3")
+        try:
+            calendar = build_google_service("calendar", "v3")
 
-        event = {
-            "summary": state.get("subject", "Meeting"),
-            "description": (
-                f"From: {state.get('sender', 'unknown')}\n"
-                f"Summary: {state.get('summary', '')}\n"
-                f"Gmail Message ID: {state.get('gmail_message_id', '')}"
-            ),
-            "start": {
-                "dateTime": start_dt.isoformat(),
-                "timeZone": self.settings.calendar_timezone,
-            },
-            "end": {
-                "dateTime": end_dt.isoformat(),
-                "timeZone": self.settings.calendar_timezone,
-            },
-        }
+            event = {
+                "summary": state.get("subject", "Meeting"),
+                "description": (
+                    f"From: {state.get('sender', 'unknown')}\n"
+                    f"Summary: {state.get('summary', '')}\n"
+                    f"Gmail Message ID: {state.get('gmail_message_id', '')}"
+                ),
+                "start": {
+                    "dateTime": start_dt.isoformat(),
+                    "timeZone": self.settings.calendar_timezone,
+                },
+                "end": {
+                    "dateTime": end_dt.isoformat(),
+                    "timeZone": self.settings.calendar_timezone,
+                },
+            }
 
-        response = (
-            calendar.events()
-            .insert(calendarId=self.settings.calendar_id, body=event, sendUpdates="none")
-            .execute()
-        )
+            response = (
+                calendar.events()
+                .insert(calendarId=self.settings.calendar_id, body=event, sendUpdates="none")
+                .execute()
+            )
 
-        event_id = response.get("id")
-        event_link = response.get("htmlLink", "")
-        self._send_telegram_calendar_created_notice(state, event_id or "", event_link)
-        return event_id
+            event_id = response.get("id")
+            event_link = response.get("htmlLink", "")
+            logger.info(
+                "Calendar event created message_id=%s event_id=%s start=%s end=%s",
+                state.get("gmail_message_id", ""),
+                event_id,
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+            )
+            self._send_telegram_calendar_created_notice(state, event_id or "", event_link)
+            return event_id
+        except HttpError as exc:
+            logger.warning(
+                "Calendar API error message_id=%s error=%s",
+                state.get("gmail_message_id", ""),
+                exc,
+            )
+            self._send_telegram_calendar_api_failed(state, str(exc))
+            return None
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Unexpected calendar creation error: %s", exc)
+            self._send_telegram_calendar_api_failed(state, str(exc))
+            return None
 
     def _infer_event_window(self, state: EmailState) -> tuple[datetime, datetime] | None:
         text = f"{state.get('subject', '')} {state.get('snippet', '')}".lower()
@@ -783,6 +815,16 @@ class GmailProcessor:
             "Calendar event not created\n"
             "I could not confidently extract meeting date/time from this email.\n"
             f"Subject: {state.get('subject', 'no subject')}"
+        )
+        self._telegram_send(text)
+
+    def _send_telegram_calendar_api_failed(self, state: EmailState, error: str) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Calendar event creation failed\n"
+            f"Subject: {state.get('subject', 'no subject')}\n"
+            f"Error: {error}"
         )
         self._telegram_send(text)
 
