@@ -197,25 +197,25 @@ class Repo:
 				)
 			conn.commit()
 
-		def has_processed_email(self, gmail_message_id: str) -> bool:
-				with self.db.connect() as conn:
-						with conn.cursor() as cur:
-								cur.execute(
-										"""
-										SELECT 1
-										FROM processed_emails
-										WHERE gmail_message_id = %s
-											AND status IN (
-												'processed',
-												'approved_and_processed',
-												'rejected',
-												'pending_human_review'
-											)
-										LIMIT 1
-										""",
-										(gmail_message_id,),
-								)
-								return cur.fetchone() is not None
+	def has_processed_email(self, gmail_message_id: str) -> bool:
+		with self.db.connect() as conn:
+			with conn.cursor() as cur:
+				cur.execute(
+					"""
+					SELECT 1
+					FROM processed_emails
+					WHERE gmail_message_id = %s
+						AND status IN (
+							'processed',
+							'approved_and_processed',
+							'rejected',
+							'pending_human_review'
+						)
+					LIMIT 1
+					""",
+					(gmail_message_id,),
+				)
+				return cur.fetchone() is not None
 
 	def insert_workflow_log(self, gmail_message_id: str, action: str, details: dict[str, Any]) -> None:
 		with self.db.connect() as conn:
