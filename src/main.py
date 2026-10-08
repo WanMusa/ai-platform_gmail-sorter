@@ -146,6 +146,9 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     if callback_query:
         callback_data = callback_query.get("data", "")
         callback_id = callback_query.get("id", "")
+        callback_message = callback_query.get("message", {})
+        callback_chat_id = str(callback_message.get("chat", {}).get("id") or "")
+        callback_message_id = int(callback_message.get("message_id") or 0)
         user = callback_query.get("from", {})
         decision_by = user.get("username") or str(user.get("id") or "unknown")
 
@@ -155,6 +158,15 @@ async def telegram_webhook(request: Request) -> JSONResponse:
                 await asyncio.to_thread(processor.answer_telegram_callback_query, callback_id, result)
             except Exception as exc:  # pragma: no cover
                 logger.warning("Failed to answer callback query: %s", exc)
+        if callback_chat_id and callback_message_id:
+            try:
+                await asyncio.to_thread(
+                    processor.clear_telegram_inline_keyboard,
+                    callback_chat_id,
+                    callback_message_id,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning("Failed to clear callback inline keyboard: %s", exc)
         return JSONResponse(status_code=200, content={"ok": True, "result": result})
 
     message = payload.get("message", {})

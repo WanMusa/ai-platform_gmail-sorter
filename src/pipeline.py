@@ -443,7 +443,8 @@ class GmailProcessor:
 
     def _node_execute(self, state: EmailState) -> EmailState:
         state = self._execute_actions(state, allow_sensitive=False)
-        state["status"] = "processed"
+        if state.get("status") != "pending_human_review":
+            state["status"] = "processed"
         return state
 
     def _node_review(self, state: EmailState) -> EmailState:
@@ -494,9 +495,11 @@ class GmailProcessor:
                 return "Category set to meeting. Confirm calendar action"
 
             state = self._execute_actions(state, allow_sensitive=False)
-            state["status"] = "approved_and_processed"
             self.repo.resolve_pending_review(review_id, "approved", decision_by)
             self._persist_state_after_review(state, review_id, decision_by, "review_category_override")
+            if state.get("status") == "pending_human_review":
+                return f"Category updated to {action_value}. Confirm send from the next prompt"
+            state["status"] = "approved_and_processed"
             return f"Category updated to {action_value}. Actions executed"
 
         if action_type == "catreply":
@@ -507,10 +510,12 @@ class GmailProcessor:
 
             if action_value == "draft":
                 state = self._execute_actions(state, allow_sensitive=False)
-                state["status"] = "approved_and_processed"
                 self.repo.resolve_pending_review(review_id, "approved", decision_by)
                 self._persist_state_after_review(state, review_id, decision_by, "review_reply_draft")
-                return "Action category selected. Draft reply flow approved"
+                if state.get("status") == "pending_human_review":
+                    return "Action category selected. Confirm send from the next prompt"
+                state["status"] = "approved_and_processed"
+                return "Action category selected. Reply processed"
 
             if action_value == "manual":
                 self.repo.set_pending_review_status(review_id, "awaiting_reply_text", decision_by)
@@ -522,10 +527,12 @@ class GmailProcessor:
         if action_type == "reply":
             if action_value == "draft":
                 state = self._execute_actions(state, allow_sensitive=False)
-                state["status"] = "approved_and_processed"
                 self.repo.resolve_pending_review(review_id, "approved", decision_by)
                 self._persist_state_after_review(state, review_id, decision_by, "review_reply_draft")
-                return "Draft reply flow approved"
+                if state.get("status") == "pending_human_review":
+                    return "Reply suggestion prepared. Confirm send from the next prompt"
+                state["status"] = "approved_and_processed"
+                return "Reply processed"
 
             if action_value == "manual":
                 self.repo.set_pending_review_status(review_id, "awaiting_reply_text", decision_by)
@@ -541,6 +548,22 @@ class GmailProcessor:
                 self.repo.resolve_pending_review(review_id, "approved", decision_by)
                 self._persist_state_after_review(state, review_id, decision_by, "review_reply_skip")
                 return "Reply skipped. Summary sent"
+
+        if action_type == "replysend":
+            if action_value == "yes":
+                sent = self._handle_reply_action(state)
+                if sent == "reply_sent":
+                    state["status"] = "approved_and_processed"
+                    self.repo.resolve_pending_review(review_id, "approved", decision_by)
+                    self._persist_state_after_review(state, review_id, decision_by, "review_reply_sent")
+                    return "Reply sent"
+                return "Reply failed to send"
+
+            if action_value == "no":
+                state["status"] = "rejected"
+                self.repo.resolve_pending_review(review_id, "rejected", decision_by)
+                self._persist_state_after_review(state, review_id, decision_by, "review_reply_send_rejected")
+                return "Reply not sent"
 
         if action_type == "meeting":
             if action_value == "yes":
@@ -599,6 +622,20 @@ class GmailProcessor:
                 "callback_query_id": callback_query_id,
                 "text": text,
                 "show_alert": False,
+            },
+        )
+
+    def clear_telegram_inline_keyboard(self, chat_id: str, message_id: int) -> None:
+        if not self.settings.telegram_bot_token or not chat_id or not message_id:
+            return
+
+        api_base = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/editMessageReplyMarkup"
+        self._telegram_post(
+            api_base,
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": {"inline_keyboard": []},
             },
         )
 
@@ -692,20 +729,11 @@ class GmailProcessor:
         text = self._render_prompt(
             "telegram_summary",
             (
-                "Gmail update\n"
-                "Category: {category}\n"
-                "Confidence: {confidence:.2f}\n"
                 "From: {sender}\n"
-                "Subject: {subject}\n"
-                "Summary: {summary}\n"
-                "Review required: {review_required}"
+                "Update: {summary}"
             ),
-            category=state.get("category", "unknown"),
-            confidence=float(state.get("confidence", 0.0)),
             sender=state.get("sender", "unknown"),
-            subject=state.get("subject", "no subject"),
             summary=state.get("summary", ""),
-            review_required="yes" if requires_review else "no",
         )
         self._telegram_send(text)
 
@@ -742,17 +770,6 @@ class GmailProcessor:
 
         self._send_telegram_summary(state, requires_review=False)
 
-    def _send_telegram_reply_draft_notice(self, state: EmailState) -> None:
-        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
-            return
-        text = self._render_prompt(
-            "reply_draft_notice",
-            "Reply draft suggested\nMessage ID: {gmail_message_id}\nSubject: {subject}",
-            gmail_message_id=state.get("gmail_message_id", ""),
-            subject=state.get("subject", "no subject"),
-        )
-        self._telegram_send(text)
-
     def _handle_reply_action(self, state: EmailState) -> str | None:
         reply_text = state.get("reply_instruction_text", "").strip()
         if reply_text:
@@ -762,13 +779,19 @@ class GmailProcessor:
                 return "reply_sent"
             return None
 
-        draft_text = self._build_draft_reply_text(state)
-        draft_id = self._create_gmail_reply_draft(state, draft_text)
-        if draft_id:
-            self._send_telegram_reply_draft_notice(state)
-            self._send_telegram_draft_created_notice(state, draft_id)
-            return "reply_draft_created"
-        return None
+        suggested_reply = self._build_draft_reply_text(state)
+        state["reply_instruction_text"] = suggested_reply
+
+        review_id = uuid4().hex
+        self.repo.create_pending_review(
+            review_id=review_id,
+            gmail_message_id=state["gmail_message_id"],
+            state_payload=dict(state),
+            telegram_chat_id=self.settings.telegram_chat_id,
+        )
+        self._send_reply_send_confirmation_request(state, review_id, suggested_reply)
+        state["status"] = "pending_human_review"
+        return "reply_confirmation_requested"
 
     def _build_draft_reply_text(self, state: EmailState) -> str:
         default_text = (
@@ -807,36 +830,6 @@ class GmailProcessor:
 
         return default_text
 
-    def _create_gmail_reply_draft(self, state: EmailState, reply_text: str) -> str | None:
-        gmail = build_gmail_client()
-        sender_email = state.get("sender_email", "")
-        if not sender_email:
-            return None
-
-        mime = MIMEText(reply_text)
-        mime["to"] = sender_email
-        mime["subject"] = self._reply_subject(state.get("subject", ""))
-        if state.get("message_rfc822_id"):
-            mime["In-Reply-To"] = state["message_rfc822_id"]
-            mime["References"] = state["message_rfc822_id"]
-
-        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
-        response = (
-            gmail.users()
-            .drafts()
-            .create(
-                userId="me",
-                body={
-                    "message": {
-                        "raw": raw,
-                        "threadId": state.get("thread_id", ""),
-                    }
-                },
-            )
-            .execute()
-        )
-        return response.get("id")
-
     def _send_gmail_reply(self, state: EmailState, reply_text: str) -> str | None:
         gmail = build_gmail_client()
         sender_email = state.get("sender_email", "")
@@ -871,27 +864,41 @@ class GmailProcessor:
             return clean
         return f"Re: {clean}"
 
-    def _send_telegram_draft_created_notice(self, state: EmailState, draft_id: str) -> None:
-        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
-            return
-        text = self._render_prompt(
-            "draft_created_notice",
-            "Draft created\nMessage ID: {gmail_message_id}\nDraft ID: {draft_id}",
-            gmail_message_id=state.get("gmail_message_id", ""),
-            draft_id=draft_id,
-        )
-        self._telegram_send(text)
-
     def _send_telegram_reply_sent_notice(self, state: EmailState, sent_message_id: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             return
         text = self._render_prompt(
             "reply_sent_notice",
-            "Reply sent\nMessage ID: {gmail_message_id}\nSent Message ID: {sent_message_id}",
-            gmail_message_id=state.get("gmail_message_id", ""),
-            sent_message_id=sent_message_id,
+            "Sent.\nI have replied to {sender}.",
+            sender=state.get("sender", "unknown"),
         )
         self._telegram_send(text)
+
+    def _send_reply_send_confirmation_request(
+        self,
+        state: EmailState,
+        review_id: str,
+        suggested_reply: str,
+    ) -> None:
+        text = self._render_prompt(
+            "reply_send_confirmation_request",
+            (
+                "I drafted a reply for this email from {sender}.\n\n"
+                "Should I send this?\n"
+                "\"{suggested_reply}\""
+            ),
+            sender=state.get("sender", "unknown"),
+            suggested_reply=suggested_reply,
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "Send", "callback_data": f"review:{review_id}:replysend:yes"},
+                    {"text": "No", "callback_data": f"review:{review_id}:replysend:no"},
+                ]
+            ]
+        }
+        self._telegram_send(text, reply_markup=reply_markup)
 
     def _create_calendar_event(self, state: EmailState) -> str | None:
         event_window = self._infer_event_window(state)

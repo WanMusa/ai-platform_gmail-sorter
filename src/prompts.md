@@ -1,28 +1,18 @@
 # Telegram Prompt Templates
 
 ## telegram_summary
-Gmail update
-Category: {category}
-Confidence: {confidence:.2f}
 From: {sender}
-Subject: {subject}
-Summary: {summary}
-Review required: {review_required}
+Update: {summary}
 
-## reply_draft_notice
-Reply draft suggested
-Message ID: {gmail_message_id}
-Subject: {subject}
+## reply_send_confirmation_request
+I drafted a reply for this email from {sender}.
 
-## draft_created_notice
-Draft created
-Message ID: {gmail_message_id}
-Draft ID: {draft_id}
+Should I send this?
+"{suggested_reply}"
 
 ## reply_sent_notice
-Reply sent
-Message ID: {gmail_message_id}
-Sent Message ID: {sent_message_id}
+Sent.
+I have replied to {sender}.
 
 ## calendar_created_notice
 Calendar event created

@@ -19,7 +19,7 @@ Rules:
 - Marketing/promotional content should be marketing.
 - You fully decide whether the assistant should notify the user. If no notification is needed, return an empty actions list and review_type="none".
 - Keep confidence between 0.0 and 1.0.
-- Keep summary concise in one sentence.
+- Keep summary concise in one sentence and conversational, as if a human assistant is giving an update.
 
 Output schema:
 {
