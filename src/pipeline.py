@@ -46,6 +46,7 @@ class EmailState(TypedDict, total=False):
     executed_actions: list[str]
     review_type: str
     reply_instruction_text: str
+    llm_failure_reason: str
     status: str
 
 
@@ -302,21 +303,37 @@ class GmailProcessor:
         llm_decision = self._classify_with_llm(state)
         if llm_decision:
             state.update(llm_decision)
+            state.pop("llm_failure_reason", None)
             return state
 
-        # Fail closed: if the LLM is unavailable/invalid, require explicit human review
-        # instead of silently replacing model behavior with deterministic classification.
+        # Strict LLM mode: if classification fails, take no user-facing action.
         state.update(
             {
                 "category": "others",
                 "confidence": 0.0,
                 "summary": self._summarize_text(state.get("subject", ""), state.get("snippet", "")),
-                "proposed_actions": ["summarize"],
-                "needs_human_review": True,
-                "review_type": "category_select",
+                "proposed_actions": [],
+                "needs_human_review": False,
+                "review_type": "none",
+                "llm_failure_reason": "LLM classification unavailable",
             }
         )
         return state
+
+    def _openai_json_completion(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
+        if not self._openai_client:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+
+        response = self._openai_client.chat.completions.create(
+            model=self.settings.openai_model,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return (response.choices[0].message.content or "").strip()
 
     def _classify_with_llm(self, state: EmailState) -> dict[str, Any] | None:
         if not self._openai_client:
@@ -336,16 +353,7 @@ class GmailProcessor:
         )
 
         try:
-            response = self._openai_client.chat.completions.create(
-                model=self.settings.openai_model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            content = (response.choices[0].message.content or "").strip()
+            content = self._openai_json_completion(system_prompt, user_prompt, temperature=0)
             parsed = json.loads(content)
             normalized = self._normalize_llm_classification(parsed, state)
             if normalized:
@@ -356,6 +364,7 @@ class GmailProcessor:
                 state.get("gmail_message_id", ""),
                 exc,
             )
+            state["llm_failure_reason"] = str(exc)
         return None
 
     def _normalize_llm_classification(
@@ -387,15 +396,6 @@ class GmailProcessor:
                 if action in valid_actions and action not in actions:
                     actions.append(action)
 
-        if not actions:
-            actions = ["summarize"]
-
-        # Guardrail: avoid calendar action when no plausible meeting time context is present.
-        if "create_calendar_event" in actions and not self._infer_event_window(state):
-            actions = [action for action in actions if action != "create_calendar_event"]
-            if category == "meeting" and "summarize" not in actions:
-                actions.append("summarize")
-
         review_type = str(parsed.get("review_type", "")).strip().lower()
         if review_type not in valid_review_types:
             review_type = "none"
@@ -414,18 +414,10 @@ class GmailProcessor:
         }
 
     def _node_route(self, state: EmailState) -> EmailState:
-        confidence = float(state.get("confidence", 0.0))
-
         proposed = [action for action in state.get("proposed_actions", []) if isinstance(action, str)]
-        if not proposed:
-            proposed = ["summarize"]
 
         review_type = str(state.get("review_type", "none"))
         needs_review = bool(state.get("needs_human_review", False))
-
-        if confidence < self.settings.confidence_threshold and not needs_review:
-            needs_review = True
-            review_type = "category_select"
 
         if review_type != "none":
             needs_review = True
@@ -790,16 +782,7 @@ class GmailProcessor:
         )
 
         try:
-            response = self._openai_client.chat.completions.create(
-                model=self.settings.openai_model,
-                temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            content = (response.choices[0].message.content or "").strip()
+            content = self._openai_json_completion(system_prompt, user_prompt, temperature=0.2)
             parsed = json.loads(content)
             reply_text = str(parsed.get("reply_text", "")).strip()
             if reply_text:
@@ -1116,6 +1099,9 @@ class GmailProcessor:
             subject=state.get("subject", "no subject"),
             summary=state.get("summary", ""),
         )
+        failure_reason = str(state.get("llm_failure_reason", "")).strip()
+        if failure_reason:
+            text = f"{text}\n\nClassifier note: {failure_reason[:240]}"
         reply_markup = {
             "inline_keyboard": [
                 [

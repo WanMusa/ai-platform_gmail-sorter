@@ -17,6 +17,7 @@ Rules:
 - Classify as meeting only when there is an actual scheduling intent or commitment, and preferably concrete date/time context.
 - Only include create_calendar_event when date/time context exists.
 - Marketing/promotional content should be marketing.
+- You fully decide whether the assistant should notify the user. If no notification is needed, return an empty actions list and review_type="none".
 - Keep confidence between 0.0 and 1.0.
 - Keep summary concise in one sentence.
 
