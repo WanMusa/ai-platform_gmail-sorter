@@ -1,88 +1,139 @@
-# ai-platform_gmail-sorter
-A Gmail agentic sorter that manages gmail and sends summary through to Telegram (auto deployment)
-
 # Gmail Sorter
 
-Event-driven Gmail assistant using:
+Event-driven Gmail assistant for triage, actioning, and approvals via Telegram.
 
-- LangGraph
-- OpenAI LLM (classification and draft generation)
-- Gmail API
-- Google Calendar API
-- Telegram
-- SQLite
-- Docker
-- GitHub Actions
+Core stack:
 
-## LLM Prompt Files
+- FastAPI + LangGraph
+- OpenAI Chat Completions
+- Gmail API + Google Calendar API
+- Telegram Bot API (webhook mode)
+- PostgreSQL
+- Docker / Compose
 
-- `src/llm_prompts.md`: model instructions for email classification and reply draft generation.
-- `src/prompts.md`: Telegram/user-facing message templates.
+## Architecture
 
-The pipeline is model-first for classification and draft reply text. Rule logic remains as fallback/guardrails if model output is unavailable or invalid.
+```mermaid
+flowchart TD
+		A[Gmail New Email] --> B[Gmail Pub/Sub]
+		B --> C[FastAPI /webhooks/gmail/pubsub]
+		C --> D[Persist Event + Idempotency Check]
+		D --> E[LangGraph Classify Node]
+		E --> F[OpenAI Classification Prompt]
+		F --> G{LLM Decision}
 
-## Gmail Watch Registration
+		G -->|No action| H[Store Processed State]
+		G -->|Marketing| I[Apply Gmail Labels]
+		G -->|Action Required| J[Telegram Reply Workflow]
+		G -->|Meeting| K[Telegram Meeting Confirm]
 
-After OAuth token setup, register Gmail webhook watch locally:
+		J --> L[LLM Draft Reply]
+		L --> M{User Confirm Send?}
+		M -->|Yes| N[Send Gmail Reply]
+		M -->|No| O[Do Nothing]
 
-1. Set values in `.env`:
-	- `GCP_PROJECT_ID`
-	- `GMAIL_PUBSUB_TOPIC`
-	- `GMAIL_WATCH_LABEL_IDS` (recommended: `INBOX`)
-2. Put OAuth token at repo root as `token.json` (or set `GOOGLE_TOKEN_PATH` to a custom path).
-   In Docker deployment, `./token.json` is mounted to `/app/token.json`.
-3. Run watch registration:
+		K --> P{Add to Calendar?}
+		P -->|Yes| Q[Create Calendar Event]
+		P -->|No| O
 
-```powershell
-python -m src.register_watch register
+		I --> H
+		N --> H
+		O --> H
+		Q --> H
 ```
 
-To stop watch:
+## Current Behavior
 
-```powershell
-python -m src.register_watch stop
-```
+- LLM-authoritative classification and action decisions.
+- Assistant-style Telegram updates (clean, minimal messages).
+- Reply workflow uses confirmation before sending; no draft-status noise.
+- Action-required options include:
+	- Draft Reply
+	- I will type reply
+	- Don't reply
+- Inline buttons are removed after selection for cleaner chat UX.
+- Meeting creation uses timezone-aware event insertion (`GOOGLE_CALENDAR_TIMEZONE`).
 
-Gmail watches expire periodically by design. This app can renew automatically when running on VPS:
+## Prompt Files
 
-- `GMAIL_WATCH_AUTO_RENEW=true`
-- `GMAIL_WATCH_RENEW_INTERVAL_SECONDS=21600`
+- `src/llm_prompts.md`: model instructions for classification and reply drafting.
+- `src/prompts.md`: Telegram-facing message templates.
 
-When enabled, the app renews watch in the background and logs renewal results.
+## Required Environment
 
-## Telegram Interactive Approval
+LLM:
 
-The app supports Telegram inline approval buttons for human review actions.
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
 
-Required env:
+Telegram:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `TELEGRAM_WEBHOOK_SECRET` (recommended)
 
-Set Telegram webhook to app endpoint:
+Google:
+
+- `GOOGLE_TOKEN_PATH` (commonly `/app/token.json` in container)
+- `GOOGLE_OAUTH_SCOPES` must include:
+	- `https://www.googleapis.com/auth/gmail.modify`
+	- `https://www.googleapis.com/auth/gmail.send`
+	- `https://www.googleapis.com/auth/calendar.events`
+- `GOOGLE_CALENDAR_ID` (default: `primary`)
+- `GOOGLE_CALENDAR_TIMEZONE` (recommended: `Pacific/Auckland`)
+
+Watch / PubSub:
+
+- `GCP_PROJECT_ID`
+- `GMAIL_PUBSUB_TOPIC`
+- `GMAIL_WATCH_LABEL_IDS` (recommended: `INBOX`)
+
+Database:
+
+- `DATABASE_HOST`
+- `DATABASE_PORT`
+- `DATABASE_NAME`
+- `DATABASE_USER`
+- `DATABASE_PASSWORD`
+
+## Register Gmail Watch
+
+After OAuth token setup:
+
+```powershell
+python -m src.register_watch register
+```
+
+Stop watch:
+
+```powershell
+python -m src.register_watch stop
+```
+
+Auto-renew settings:
+
+- `GMAIL_WATCH_AUTO_RENEW=true`
+- `GMAIL_WATCH_RENEW_INTERVAL_SECONDS=21600`
+
+## Telegram Webhook
+
+Set webhook URL:
 
 ```text
 https://wanagents.duckdns.org/webhooks/telegram
 ```
 
-Set webhook with optional secret token:
+Set webhook with secret:
 
 ```text
 https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://wanagents.duckdns.org/webhooks/telegram&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 ```
 
-## Calendar Event Creation
+## Local LLM Smoke Test
 
-When meeting confirmation is approved, the app can create a Google Calendar event.
+Use the local test helper:
 
-Required env:
-
-- `GOOGLE_CALENDAR_ID` (default: `primary`)
-- `GOOGLE_CALENDAR_TIMEZONE` (default: `Asia/Kuala_Lumpur`)
-- `CALENDAR_DEFAULT_DURATION_MINUTES` (default: `60`)
-
-Important:
-
-- `GOOGLE_OAUTH_SCOPES` must include `https://www.googleapis.com/auth/calendar.events`.
-- If your token was created before adding this scope, run OAuth again to regenerate `token.json`.
+```powershell
+python local/test-data/LLM/test_openai.py --mode smoke
+python local/test-data/LLM/test_openai.py --mode classify --subject "package posted" --snippet "Your package has been posted and tracking number will follow shortly."
+```
