@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime, parseaddr
 from typing import Any, TypedDict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from googleapiclient.errors import HttpError
 from langgraph.graph import StateGraph, END
@@ -733,10 +734,19 @@ class GmailProcessor:
 
     def _infer_event_window(self, state: EmailState) -> tuple[datetime, datetime] | None:
         text = f"{state.get('subject', '')} {state.get('snippet', '')}".lower()
-        base_dt = datetime.now(timezone.utc)
+        try:
+            event_tz = ZoneInfo(self.settings.calendar_timezone)
+        except ZoneInfoNotFoundError:
+            logger.warning(
+                "Unknown calendar timezone '%s', falling back to UTC",
+                self.settings.calendar_timezone,
+            )
+            event_tz = timezone.utc
+
+        base_dt = datetime.now(event_tz)
         if state.get("received_at"):
             try:
-                base_dt = datetime.fromisoformat(str(state["received_at"]))
+                base_dt = datetime.fromisoformat(str(state["received_at"])).astimezone(event_tz)
             except ValueError:
                 pass
 
@@ -787,7 +797,7 @@ class GmailProcessor:
             day=target_date.day,
             hour=hour,
             minute=minute,
-            tzinfo=timezone.utc,
+            tzinfo=event_tz,
         )
         end = start + timedelta(minutes=self.settings.calendar_default_duration_minutes)
         return start, end
