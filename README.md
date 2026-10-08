@@ -6,12 +6,20 @@ A Gmail agentic sorter that manages gmail and sends summary through to Telegram 
 Event-driven Gmail assistant using:
 
 - LangGraph
+- OpenAI LLM (classification and draft generation)
 - Gmail API
 - Google Calendar API
 - Telegram
 - SQLite
 - Docker
 - GitHub Actions
+
+## LLM Prompt Files
+
+- `src/llm_prompts.md`: model instructions for email classification and reply draft generation.
+- `src/prompts.md`: Telegram/user-facing message templates.
+
+The pipeline is model-first for classification and draft reply text. Rule logic remains as fallback/guardrails if model output is unavailable or invalid.
 
 ## Gmail Watch Registration
 

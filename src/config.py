@@ -31,6 +31,8 @@ class Settings:
 	app_port: int
 	log_level: str
 	retry_max_attempts: int
+	openai_api_key: str
+	openai_model: str
 
 	google_token_path: str
 	google_oauth_scopes: list[str]
@@ -77,6 +79,8 @@ def get_settings() -> Settings:
 		app_port=_env_int("APP_PORT", 8000),
 		log_level=os.getenv("LOG_LEVEL", "INFO"),
 		retry_max_attempts=_env_int("RETRY_MAX_ATTEMPTS", 2),
+		openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+		openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
 		google_token_path=os.getenv("GOOGLE_TOKEN_PATH", "token.json"),
 		google_oauth_scopes=_env_csv(
 			"GOOGLE_OAUTH_SCOPES",

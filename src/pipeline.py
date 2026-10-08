@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from googleapiclient.errors import HttpError
 from langgraph.graph import StateGraph, END
+from openai import OpenAI
 
 from src.config import Settings
 from src.db import Repo
@@ -53,12 +54,16 @@ class GmailProcessor:
         self.settings = settings
         self.repo = repo
         self._label_cache: dict[str, str] = {}
-        self._prompt_templates = self._load_prompt_templates()
+        self._prompt_templates = self._load_templates("prompts.md")
+        self._llm_prompt_templates = self._load_templates("llm_prompts.md")
+        self._openai_client = (
+            OpenAI(api_key=self.settings.openai_api_key) if self.settings.openai_api_key else None
+        )
         self._processing_lock = threading.Lock()
         self._graph = self._build_graph()
 
-    def _load_prompt_templates(self) -> dict[str, str]:
-        prompts_path = Path(__file__).with_name("prompts.md")
+    def _load_templates(self, file_name: str) -> dict[str, str]:
+        prompts_path = Path(__file__).with_name(file_name)
         try:
             raw = prompts_path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -87,6 +92,16 @@ class GmailProcessor:
 
     def _render_prompt(self, key: str, fallback: str, **values: Any) -> str:
         template = self._prompt_templates.get(key, fallback).strip()
+        safe_values: defaultdict[str, Any] = defaultdict(str)
+        safe_values.update(values)
+
+        try:
+            return template.format_map(safe_values)
+        except Exception:
+            return fallback.format_map(safe_values)
+
+    def _render_llm_prompt(self, key: str, fallback: str, **values: Any) -> str:
+        template = self._llm_prompt_templates.get(key, fallback).strip()
         safe_values: defaultdict[str, Any] = defaultdict(str)
         safe_values.update(values)
 
@@ -284,6 +299,118 @@ class GmailProcessor:
         return graph.compile()
 
     def _node_classify(self, state: EmailState) -> EmailState:
+        llm_decision = self._classify_with_llm(state)
+        if llm_decision:
+            state.update(llm_decision)
+            return state
+
+        fallback = self._classify_with_rules(state)
+        state.update(fallback)
+        return state
+
+    def _classify_with_llm(self, state: EmailState) -> dict[str, Any] | None:
+        if not self._openai_client:
+            return None
+
+        system_prompt = self._render_llm_prompt(
+            "email_classification_system",
+            "Return strict JSON classification for the provided email.",
+        )
+        user_prompt = self._render_llm_prompt(
+            "email_classification_user",
+            "From: {sender}\nSender Email: {sender_email}\nSubject: {subject}\nSnippet: {snippet}",
+            sender=state.get("sender", ""),
+            sender_email=state.get("sender_email", ""),
+            subject=state.get("subject", ""),
+            snippet=state.get("snippet", ""),
+        )
+
+        try:
+            response = self._openai_client.chat.completions.create(
+                model=self.settings.openai_model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            content = (response.choices[0].message.content or "").strip()
+            parsed = json.loads(content)
+            normalized = self._normalize_llm_classification(parsed, state)
+            if normalized:
+                return normalized
+        except Exception as exc:
+            logger.warning(
+                "LLM classification failed message_id=%s error=%s",
+                state.get("gmail_message_id", ""),
+                exc,
+            )
+        return None
+
+    def _normalize_llm_classification(
+        self, parsed: dict[str, Any], state: EmailState
+    ) -> dict[str, Any] | None:
+        valid_categories = {"information", "action_required", "meeting", "marketing", "others"}
+        valid_actions = {"summarize", "draft_reply", "create_calendar_event", "label_marketing"}
+        valid_review_types = {"none", "category_select", "reply_mode", "meeting_confirm"}
+
+        category = str(parsed.get("category", "others")).strip().lower()
+        if category not in valid_categories:
+            category = "others"
+
+        try:
+            confidence = float(parsed.get("confidence", 0.7))
+        except (TypeError, ValueError):
+            confidence = 0.7
+        confidence = max(0.0, min(1.0, confidence))
+
+        summary = str(parsed.get("summary") or "").strip()
+        if not summary:
+            summary = self._summarize_text(state.get("subject", ""), state.get("snippet", ""))
+
+        raw_actions = parsed.get("proposed_actions", [])
+        actions: list[str] = []
+        if isinstance(raw_actions, list):
+            for item in raw_actions:
+                action = str(item).strip().lower()
+                if action in valid_actions and action not in actions:
+                    actions.append(action)
+
+        if not actions:
+            actions = self._default_actions_for_category(category)
+
+        # Guardrail: avoid calendar action when no plausible meeting time context is present.
+        if "create_calendar_event" in actions and not self._infer_event_window(state):
+            actions = [action for action in actions if action != "create_calendar_event"]
+
+        review_type = str(parsed.get("review_type", "")).strip().lower()
+        if review_type not in valid_review_types:
+            if category == "action_required":
+                review_type = "reply_mode"
+            elif category == "meeting":
+                review_type = "meeting_confirm"
+            else:
+                review_type = "none"
+
+        needs_human_review = bool(parsed.get("needs_human_review", False))
+        if category in {"action_required", "meeting"}:
+            needs_human_review = True
+        if review_type == "none" and needs_human_review:
+            review_type = "category_select"
+        if review_type != "none":
+            needs_human_review = True
+
+        return {
+            "category": category,
+            "confidence": confidence,
+            "summary": summary,
+            "proposed_actions": actions,
+            "needs_human_review": needs_human_review,
+            "review_type": review_type,
+        }
+
+    def _classify_with_rules(self, state: EmailState) -> dict[str, Any]:
         subject = state.get("subject", "").lower()
         snippet = state.get("snippet", "").lower()
         sender = state.get("sender", "").lower()
@@ -320,20 +447,38 @@ class GmailProcessor:
         ]
         action_tokens = ["please", "can you", "could you", "need", "action required", "respond"]
         info_sender_tokens = ["noreply", "no-reply", "notification", "donotreply"]
+        transactional_info_tokens = [
+            "tracking number",
+            "package posted",
+            "order shipped",
+            "shipping update",
+            "delivery update",
+            "your package",
+            "has been posted",
+            "receipt",
+            "invoice",
+            "payment received",
+            "statement",
+            "order confirmation",
+        ]
 
         has_explicit_time = bool(re.search(r"\b\d{1,2}(:\d{2})?\s*(am|pm)\b", text))
         has_meeting_token = any(token in text for token in meeting_tokens)
+        has_transactional_info = any(token in text for token in transactional_info_tokens)
+        has_action_signal = "?" in state.get("subject", "") or any(
+            token in text for token in action_tokens
+        )
 
-        if any(token in text for token in marketing_tokens):
-            category = "marketing"
-            confidence = 0.93
+        if has_transactional_info and not has_action_signal:
+            category = "information"
+            confidence = 0.95
         elif has_meeting_token and (has_explicit_time or " at " in text or "harbour" in text):
             category = "meeting"
             confidence = 0.94
         elif has_meeting_token:
             category = "meeting"
             confidence = 0.85
-        elif "?" in state.get("subject", "") or any(token in text for token in action_tokens):
+        elif has_action_signal:
             category = "action_required"
             confidence = 0.84
         elif any(token in sender for token in info_sender_tokens) or any(
@@ -341,41 +486,51 @@ class GmailProcessor:
         ):
             category = "information"
             confidence = 0.86
+        elif any(token in text for token in marketing_tokens):
+            category = "marketing"
+            confidence = 0.93
 
-        summary = self._summarize_text(state.get("subject", ""), state.get("snippet", ""))
+        return {
+            "category": category,
+            "confidence": confidence,
+            "summary": self._summarize_text(state.get("subject", ""), state.get("snippet", "")),
+        }
 
-        state["category"] = category
-        state["confidence"] = confidence
-        state["summary"] = summary
-        return state
+    def _default_actions_for_category(self, category: str) -> list[str]:
+        if category == "marketing":
+            return ["label_marketing"]
+        if category == "meeting":
+            return ["summarize", "create_calendar_event"]
+        if category == "action_required":
+            return ["summarize", "draft_reply"]
+        if category == "information":
+            return ["summarize"]
+        return ["summarize"]
 
     def _node_route(self, state: EmailState) -> EmailState:
         category = state.get("category", "others")
         confidence = float(state.get("confidence", 0.0))
 
-        proposed: list[str] = []
-        if category == "marketing":
-            proposed.append("label_marketing")
-        elif category == "meeting":
-            proposed.extend(["summarize", "create_calendar_event"])
-        elif category == "action_required":
-            proposed.extend(["summarize", "draft_reply"])
-        elif category == "information":
-            proposed.append("summarize")
-        else:
-            proposed.append("summarize")
+        proposed = [action for action in state.get("proposed_actions", []) if isinstance(action, str)]
+        if not proposed:
+            proposed = self._default_actions_for_category(category)
 
-        review_type = "none"
-        needs_review = False
-        if confidence < self.settings.confidence_threshold:
+        review_type = str(state.get("review_type", "none"))
+        needs_review = bool(state.get("needs_human_review", False))
+
+        if confidence < self.settings.confidence_threshold and not needs_review:
             needs_review = True
             review_type = "category_select"
-        elif category == "action_required":
+
+        if category == "action_required" and review_type == "none":
             needs_review = True
             review_type = "reply_mode"
-        elif category == "meeting":
+        elif category == "meeting" and review_type == "none":
             needs_review = True
             review_type = "meeting_confirm"
+
+        if review_type != "none":
+            needs_review = True
 
         state["proposed_actions"] = proposed
         state["needs_human_review"] = needs_review
@@ -706,7 +861,7 @@ class GmailProcessor:
                 return "reply_sent"
             return None
 
-        draft_text = self._build_default_reply_text(state)
+        draft_text = self._build_draft_reply_text(state)
         draft_id = self._create_gmail_reply_draft(state, draft_text)
         if draft_id:
             self._send_telegram_reply_draft_notice(state)
@@ -714,12 +869,51 @@ class GmailProcessor:
             return "reply_draft_created"
         return None
 
-    def _build_default_reply_text(self, state: EmailState) -> str:
-        return (
+    def _build_draft_reply_text(self, state: EmailState) -> str:
+        default_text = (
             "Thanks for your email.\n\n"
             "I have reviewed your message and will get back to you shortly.\n\n"
             "Best regards"
         )
+        if not self._openai_client:
+            return default_text
+
+        system_prompt = self._render_llm_prompt(
+            "draft_reply_system",
+            "Write a concise professional draft reply and return JSON with reply_text.",
+        )
+        user_prompt = self._render_llm_prompt(
+            "draft_reply_user",
+            "From: {sender}\nSubject: {subject}\nSummary: {summary}\nOriginal snippet: {snippet}",
+            sender=state.get("sender", ""),
+            subject=state.get("subject", ""),
+            summary=state.get("summary", ""),
+            snippet=state.get("snippet", ""),
+        )
+
+        try:
+            response = self._openai_client.chat.completions.create(
+                model=self.settings.openai_model,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            content = (response.choices[0].message.content or "").strip()
+            parsed = json.loads(content)
+            reply_text = str(parsed.get("reply_text", "")).strip()
+            if reply_text:
+                return reply_text
+        except Exception as exc:
+            logger.warning(
+                "LLM draft reply generation failed message_id=%s error=%s",
+                state.get("gmail_message_id", ""),
+                exc,
+            )
+
+        return default_text
 
     def _create_gmail_reply_draft(self, state: EmailState, reply_text: str) -> str | None:
         gmail = build_gmail_client()
