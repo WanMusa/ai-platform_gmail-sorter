@@ -58,7 +58,6 @@ class Settings:
 	auto_actions: list[str]
 	approval_required_actions: list[str]
 	telegram_notify_categories: list[str]
-	confidence_threshold: float
 
 	db_host: str
 	db_port: int
@@ -68,12 +67,6 @@ class Settings:
 
 
 def get_settings() -> Settings:
-	confidence_raw = os.getenv("CONFIDENCE_THRESHOLD", "0.80")
-	try:
-		confidence = float(confidence_raw)
-	except ValueError:
-		confidence = 0.80
-
 	return Settings(
 		app_domain=os.getenv("APP_DOMAIN", ""),
 		app_port=_env_int("APP_PORT", 8000),
@@ -112,7 +105,6 @@ def get_settings() -> Settings:
 		telegram_notify_categories=_env_csv(
 			"TELEGRAM_NOTIFY_CATEGORIES", "meeting,action_required"
 		),
-		confidence_threshold=confidence,
 		db_host=os.getenv("DATABASE_HOST", "postgres"),
 		db_port=_env_int("DATABASE_PORT", 5432),
 		db_name=os.getenv("DATABASE_NAME", "gmail_sorter"),

@@ -324,15 +324,26 @@ class GmailProcessor:
         if not self._openai_client:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
-        response = self._openai_client.chat.completions.create(
-            model=self.settings.openai_model,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-            messages=[
+        request_payload: dict[str, Any] = {
+            "model": self.settings.openai_model,
+            "temperature": temperature,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-        )
+        }
+
+        try:
+            response = self._openai_client.chat.completions.create(**request_payload)
+        except Exception as exc:
+            # Some models only accept their default temperature and reject explicit values.
+            if "temperature" in str(exc).lower() and "unsupported" in str(exc).lower():
+                request_payload.pop("temperature", None)
+                response = self._openai_client.chat.completions.create(**request_payload)
+            else:
+                raise
+
         return (response.choices[0].message.content or "").strip()
 
     def _classify_with_llm(self, state: EmailState) -> dict[str, Any] | None:
