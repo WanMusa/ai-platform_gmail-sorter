@@ -49,6 +49,18 @@ def _load_credentials(token_path: Path, scopes: list[str]) -> Credentials:
         creds.refresh(Request())
         token_path.write_text(creds.to_json(), encoding="utf-8")
 
+    granted_scopes = set((creds.granted_scopes or creds.scopes or []))
+    missing_scopes = [scope for scope in scopes if scope not in granted_scopes]
+    if missing_scopes:
+        missing_text = ", ".join(missing_scopes)
+        required_text = ",".join(scopes)
+        raise PermissionError(
+            "OAuth token is missing required scopes "
+            f"[{missing_text}] from {token_path}. "
+            "Regenerate token.json with GOOGLE_OAUTH_SCOPES set to: "
+            f"{required_text}"
+        )
+
     return creds
 
 

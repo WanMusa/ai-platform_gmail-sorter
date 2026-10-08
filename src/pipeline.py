@@ -725,6 +725,13 @@ class GmailProcessor:
                 state.get("gmail_message_id", ""),
                 exc,
             )
+            error_text = str(exc)
+            if (
+                "insufficientPermissions" in error_text
+                or "insufficient authentication scopes" in error_text.lower()
+            ):
+                self._send_telegram_calendar_scope_failed(state)
+                return None
             self._send_telegram_calendar_api_failed(state, str(exc))
             return None
         except Exception as exc:  # pragma: no cover
@@ -835,6 +842,18 @@ class GmailProcessor:
             "Calendar event creation failed\n"
             f"Subject: {state.get('subject', 'no subject')}\n"
             f"Error: {error}"
+        )
+        self._telegram_send(text)
+
+    def _send_telegram_calendar_scope_failed(self, state: EmailState) -> None:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return
+        text = (
+            "Calendar event creation failed\n"
+            f"Subject: {state.get('subject', 'no subject')}\n"
+            "Reason: OAuth token lacks calendar.events scope.\n"
+            "Action: regenerate token.json with GOOGLE_OAUTH_SCOPES including "
+            "https://www.googleapis.com/auth/calendar.events and redeploy."
         )
         self._telegram_send(text)
 
