@@ -2,6 +2,13 @@
 
 Event-driven Gmail assistant for triage, actioning, and approvals via Telegram.
 
+## Project Highlights
+
+- LangGraph-driven orchestration for multi-step agent workflows (classify, route, execute, review).
+- OpenAI-powered decision engine for email classification, summary generation, and reply drafting.
+- Production deployment on Oracle VPS with HTTPS reverse proxy, webhook architecture, and shared PostgreSQL.
+- End-to-end event-driven design (Gmail Pub/Sub + Telegram webhooks) with idempotent processing.
+
 Core stack:
 
 - FastAPI + LangGraph
@@ -10,6 +17,7 @@ Core stack:
 - Telegram Bot API (webhook mode)
 - PostgreSQL
 - Docker / Compose
+- Oracle VPS (production host)
 
 ## Architecture
 
@@ -41,6 +49,13 @@ flowchart TD
 		O --> H
 		Q --> H
 ```
+
+## Why This Is Advanced
+
+- Agentic orchestration: uses LangGraph state transitions instead of one-shot scripts.
+- Human-in-the-loop controls: action confirmation paths for replies and calendar actions.
+- Production-ready infra: reverse proxy TLS, persistent database, auto-renewing Gmail watch, and webhook security controls.
+- Observable behavior: workflow logs + deterministic state persistence for reproducibility.
 
 ## Current Behavior
 
@@ -128,6 +143,14 @@ Set webhook with secret:
 ```text
 https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://wanagents.duckdns.org/webhooks/telegram&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 ```
+
+## Deployment (Oracle VPS)
+
+This project is intended to run on an Oracle VPS using Docker Compose and a shared infrastructure layer.
+
+- App service (`ai-platform_gmail-sorter`) joins the shared `ai_platform` Docker network.
+- HTTPS termination and certificate automation are handled by the infrastructure stack in `ai-platform_infra`.
+- Push-to-deploy can be managed through GitHub Actions for reproducible updates.
 
 ## Local LLM Smoke Test
 
