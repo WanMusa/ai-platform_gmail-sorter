@@ -83,7 +83,7 @@ def get_settings() -> Settings:
 		gmail_label_include=os.getenv("GMAIL_LABEL_INCLUDE", "AI"),
 		gmail_label_to_delete=os.getenv("GMAIL_LABEL_TO_DELETE", "AI/to-delete"),
 		calendar_id=os.getenv("GOOGLE_CALENDAR_ID", "primary"),
-		calendar_timezone=os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Asia/Kuala_Lumpur"),
+		calendar_timezone=os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Pacific/Auckland"),
 		calendar_default_duration_minutes=_env_int("CALENDAR_DEFAULT_DURATION_MINUTES", 60),
 		watch_auto_renew=_env_bool("GMAIL_WATCH_AUTO_RENEW", True),
 		watch_renew_interval_seconds=_env_int("GMAIL_WATCH_RENEW_INTERVAL_SECONDS", 21600),

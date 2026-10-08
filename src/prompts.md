@@ -15,10 +15,7 @@ Sent.
 I have replied to {sender}.
 
 ## calendar_created_notice
-Calendar event created
-Message ID: {gmail_message_id}
-Event ID: {event_id}
-Link: {event_link}
+Done. I added it to your calendar.
 
 ## calendar_parse_failed
 Calendar event not created
@@ -58,12 +55,11 @@ Summary: {summary}
 How should I handle the reply?
 
 ## meeting_confirmation_request
-Meeting email detected
+I spotted a meeting request.
 From: {sender}
-Subject: {subject}
 Summary: {summary}
 
-Confirm appointment and create calendar event?
+Add this to your calendar?
 
 ## reply_text_prompt
 Please send the exact reply text in your next message.

@@ -611,14 +611,10 @@ class GmailProcessor:
                 return "Send the exact reply text in your next message"
 
             if action_value == "skip":
-                state["proposed_actions"] = [
-                    action for action in state.get("proposed_actions", []) if action != "draft_reply"
-                ]
-                state = self._execute_actions(state, allow_sensitive=False)
-                state["status"] = "approved_and_processed"
-                self.repo.resolve_pending_review(review_id, "approved", decision_by)
+                state["status"] = "rejected"
+                self.repo.resolve_pending_review(review_id, "rejected", decision_by)
                 self._persist_state_after_review(state, review_id, decision_by, "review_reply_skip")
-                return "Reply skipped. Summary sent"
+                return "No reply sent"
 
         if action_type == "replysend":
             if action_value == "yes":
@@ -712,6 +708,7 @@ class GmailProcessor:
 
     def _execute_actions(self, state: EmailState, allow_sensitive: bool) -> EmailState:
         executed = list(state.get("executed_actions", []))
+        proposed_actions = [action for action in state.get("proposed_actions", []) if isinstance(action, str)]
         for action in state.get("proposed_actions", []):
             if not allow_sensitive and action not in self.settings.auto_actions:
                 continue
@@ -719,6 +716,14 @@ class GmailProcessor:
                 self._apply_marketing_labels(state["gmail_message_id"])
                 executed.append(action)
             elif action == "summarize":
+                if "draft_reply" in proposed_actions or "create_calendar_event" in proposed_actions:
+                    logger.info(
+                        "Skipping summary because richer flow exists message_id=%s actions=%s",
+                        state.get("gmail_message_id", ""),
+                        proposed_actions,
+                    )
+                    executed.append(action)
+                    continue
                 if self._should_notify(state):
                     self._send_telegram_summary(state, requires_review=False)
                 else:
@@ -1234,6 +1239,9 @@ class GmailProcessor:
                 [
                     {"text": "Draft Reply", "callback_data": f"review:{review_id}:reply:draft"},
                     {"text": "I will type reply", "callback_data": f"review:{review_id}:reply:manual"},
+                ],
+                [
+                    {"text": "Don't reply", "callback_data": f"review:{review_id}:reply:skip"},
                 ],
             ]
         }
