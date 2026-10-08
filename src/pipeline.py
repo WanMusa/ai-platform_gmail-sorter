@@ -93,23 +93,29 @@ class GmailProcessor:
 
     def _render_prompt(self, key: str, fallback: str, **values: Any) -> str:
         template = self._prompt_templates.get(key, fallback).strip()
+        if not values:
+            return template
+
         safe_values: defaultdict[str, Any] = defaultdict(str)
         safe_values.update(values)
 
         try:
             return template.format_map(safe_values)
         except Exception:
-            return fallback.format_map(safe_values)
+            return template
 
     def _render_llm_prompt(self, key: str, fallback: str, **values: Any) -> str:
         template = self._llm_prompt_templates.get(key, fallback).strip()
+        if not values:
+            return template
+
         safe_values: defaultdict[str, Any] = defaultdict(str)
         safe_values.update(values)
 
         try:
             return template.format_map(safe_values)
         except Exception:
-            return fallback.format_map(safe_values)
+            return template
 
     def process_pubsub_event(self, event_id: int, decoded_payload: dict[str, Any]) -> None:
         with self._processing_lock:
@@ -366,8 +372,22 @@ class GmailProcessor:
         try:
             content = self._openai_json_completion(system_prompt, user_prompt, temperature=0)
             parsed = json.loads(content)
+            logger.info(
+                "LLM raw classification message_id=%s content=%s",
+                state.get("gmail_message_id", ""),
+                content[:1000],
+            )
             normalized = self._normalize_llm_classification(parsed, state)
             if normalized:
+                logger.info(
+                    "LLM normalized classification message_id=%s category=%s confidence=%.2f actions=%s review_type=%s needs_review=%s",
+                    state.get("gmail_message_id", ""),
+                    normalized.get("category", "others"),
+                    float(normalized.get("confidence", 0.0)),
+                    normalized.get("proposed_actions", []),
+                    normalized.get("review_type", "none"),
+                    normalized.get("needs_human_review", False),
+                )
                 return normalized
         except Exception as exc:
             logger.warning(
@@ -385,7 +405,17 @@ class GmailProcessor:
         valid_actions = {"summarize", "draft_reply", "create_calendar_event", "label_marketing"}
         valid_review_types = {"none", "category_select", "reply_mode", "meeting_confirm"}
 
-        category = str(parsed.get("category", "others")).strip().lower()
+        category_raw = parsed.get("category") or parsed.get("label") or parsed.get("type")
+        category = str(category_raw or "others").strip().lower()
+        category_aliases = {
+            "request_for_confirmation": "action_required",
+            "confirmation_request": "action_required",
+            "request": "action_required",
+            "promo": "marketing",
+            "promotional": "marketing",
+            "notification": "information",
+        }
+        category = category_aliases.get(category, category)
         if category not in valid_categories:
             category = "others"
 
@@ -399,21 +429,62 @@ class GmailProcessor:
         if not summary:
             summary = self._summarize_text(state.get("subject", ""), state.get("snippet", ""))
 
-        raw_actions = parsed.get("proposed_actions", [])
+        raw_actions = parsed.get("proposed_actions")
+        if raw_actions is None:
+            raw_actions = parsed.get("actions", [])
         actions: list[str] = []
+        action_aliases = {
+            "summary": "summarize",
+            "send_summary": "summarize",
+            "reply": "draft_reply",
+            "reply_draft": "draft_reply",
+            "create_event": "create_calendar_event",
+            "calendar_event": "create_calendar_event",
+            "label": "label_marketing",
+            "mark_marketing": "label_marketing",
+        }
+
+        if isinstance(raw_actions, str):
+            raw_actions = [item.strip() for item in raw_actions.split(",") if item.strip()]
+
         if isinstance(raw_actions, list):
             for item in raw_actions:
-                action = str(item).strip().lower()
+                action = str(item).strip().lower().replace(" ", "_")
+                action = action_aliases.get(action, action)
                 if action in valid_actions and action not in actions:
                     actions.append(action)
 
-        review_type = str(parsed.get("review_type", "")).strip().lower()
+        if not actions and bool(parsed.get("action_required")):
+            actions = ["summarize", "draft_reply"]
+
+        review_type = str(parsed.get("review_type") or parsed.get("review") or "").strip().lower()
+        review_aliases = {
+            "reply": "reply_mode",
+            "meeting": "meeting_confirm",
+            "category": "category_select",
+            "no": "none",
+        }
+        review_type = review_aliases.get(review_type, review_type)
         if review_type not in valid_review_types:
             review_type = "none"
 
-        needs_human_review = bool(parsed.get("needs_human_review", review_type != "none"))
+        needs_human_review_raw = parsed.get("needs_human_review", parsed.get("requires_review"))
+        if isinstance(needs_human_review_raw, str):
+            needs_human_review = needs_human_review_raw.strip().lower() in {"1", "true", "yes", "y"}
+        elif isinstance(needs_human_review_raw, bool):
+            needs_human_review = needs_human_review_raw
+        else:
+            needs_human_review = review_type != "none"
+
         if review_type != "none":
             needs_human_review = True
+
+        if category == "others" and not actions and review_type == "none" and not needs_human_review:
+            logger.warning(
+                "LLM returned neutral decision message_id=%s parsed=%s",
+                state.get("gmail_message_id", ""),
+                json.dumps(parsed, ensure_ascii=True)[:1000],
+            )
 
         return {
             "category": category,

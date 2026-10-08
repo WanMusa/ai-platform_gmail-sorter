@@ -21,6 +21,13 @@ Rules:
 - Keep confidence between 0.0 and 1.0.
 - Keep summary concise in one sentence and conversational, as if a human assistant is giving an update.
 
+Decision policy:
+- For category=action_required: include summarize and draft_reply.
+- For category=meeting: include summarize. Include create_calendar_event only when specific date/time is present.
+- For category=information: include summarize for meaningful status updates.
+- For category=marketing: include label_marketing and review_type="none".
+- Use category=others with empty actions only when there is genuinely no useful update or action.
+
 Output schema:
 {
   "category": "information|action_required|meeting|marketing|others",
