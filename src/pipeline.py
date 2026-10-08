@@ -474,6 +474,12 @@ class GmailProcessor:
 
         add_label_ids = [label_id for label_id in [include_label_id, delete_label_id] if label_id]
         if not add_label_ids:
+            logger.warning(
+                "No marketing labels resolved for message_id=%s include=%s delete=%s",
+                gmail_message_id,
+                self.settings.gmail_label_include,
+                self.settings.gmail_label_to_delete,
+            )
             return
 
         gmail.users().messages().modify(
@@ -486,12 +492,23 @@ class GmailProcessor:
         if label_name in self._label_cache:
             return self._label_cache[label_name]
 
+        normalized = label_name.lower().strip()
+        cache_key = f"__norm__:{normalized}"
+        if cache_key in self._label_cache:
+            return self._label_cache[cache_key]
+
         gmail = build_gmail_client()
         labels_response = gmail.users().labels().list(userId="me").execute()
         for label in labels_response.get("labels", []):
-            self._label_cache[label.get("name", "")] = label.get("id")
+            name = label.get("name", "")
+            label_id = label.get("id")
+            self._label_cache[name] = label_id
+            self._label_cache[f"__norm__:{name.lower().strip()}"] = label_id
 
-        return self._label_cache.get(label_name)
+        resolved = self._label_cache.get(label_name) or self._label_cache.get(cache_key)
+        if not resolved:
+            logger.warning("Label not found for configured name=%s", label_name)
+        return resolved
 
     def _send_telegram_summary(self, state: EmailState, requires_review: bool) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
